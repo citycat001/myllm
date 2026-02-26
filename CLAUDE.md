@@ -13,7 +13,7 @@ When a new step is implemented, always generate a corresponding article in `arti
 
 ## Language
 
-Articles are written in **Chinese (中文)** for publishing on WeChat Official Account (微信公众号). All communication with the user should also be in Chinese. Code and code comments remain in English.
+Articles are written in **Chinese (中文)** for publishing on WeChat Official Account (微信公众号). All communication with the user should also be in Chinese. Code comments are also in Chinese, using a 通俗易懂 (accessible/plain language) style with analogies.
 
 ## Project Overview
 
