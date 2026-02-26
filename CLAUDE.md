@@ -9,7 +9,7 @@ This is a public learning project that documents the journey of building an LLM 
 1. **Code** — Progressively build a language model from a simple bigram to a full transformer, step by step.
 2. **Articles** — For every implementation step, produce a how-to article in `articles/` (e.g. `articles/01-baby-step-bigram-model.md`) suitable for sharing on social media. Articles should walk readers through what was built, why, and how — written as a teaching guide, not just a changelog.
 
-When a new step is implemented, always generate a corresponding article in `articles/` with a numbered prefix matching the step order.
+When a new step is implemented, always generate a corresponding article in `articles/` with a numbered prefix matching the step order. Before writing, read `articles/introduction.md` for the shared concept framework, roadmap, learning plan, and writing conventions.
 
 ## Language
 
