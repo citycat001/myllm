@@ -141,10 +141,15 @@ def get_batch(split: str):
     return x.to(DEVICE), y.to(DEVICE)
 
 
-@torch.no_grad()  # 看成绩时不需要算梯度，关掉省内存
+@torch.no_grad()  # 考试时不需要算梯度（不用"记纠错笔记"），关掉省内存
 def estimate_loss(model):
     """
-    算一下模型当前的"考试分数"（train loss 和 val loss）。
+    给模型做一次"模拟考试"，看看当前水平如何。
+
+    注意：这里虽然也用了 cross_entropy 算 loss，但和训练时的意义完全不同：
+      - 训练时：算 loss → backward() 算梯度 → step() 更新参数（"做题→对答案→纠正"）
+      - 评估时：算 loss → 只是把分数记下来，不做 backward，不做 step（"考试→看分数→不改卷"）
+    cross_entropy 在这里只是一把"尺子"——训练时用它量完会动手纠正，评估时用它量完只是看看。
 
     做法：随机抽 200 组题，每组算一个分数，最后取平均。
     这样比只看一组题更稳定、更有代表性。
@@ -155,10 +160,13 @@ def estimate_loss(model):
         losses = torch.zeros(EVAL_ITERS)
         for k in range(EVAL_ITERS):
             xb, yb = get_batch(split)
+            # 这里调用 model(xb, yb) 会算 cross_entropy loss，
+            # 但注意：我们只是读取 loss 的数值（.item()），
+            # 没有调用 loss.backward()，所以模型参数不会被改动。
             _, loss = model(xb, yb)
             losses[k] = loss.item()  # .item() 把张量里的数字取出来变成普通 Python 数字
         out[split] = losses.mean().item()
-    model.train()  # 切回"学习模式"
+    model.train()  # 考完了，切回"学习模式"继续训练
     return out
 
 

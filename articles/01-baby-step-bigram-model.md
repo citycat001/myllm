@@ -418,21 +418,31 @@ for step in range(MAX_STEPS):
 
 这就是所有深度学习训练的核心循环——不管是我们这个最简单的 Bigram 模型，还是几百亿参数的 GPT，训练过程都是这六步，只是模型本身更复杂而已。
 
-### estimate_loss 中的 @torch.no_grad()
+### estimate_loss——给模型做模拟考试
 
-```python
-@torch.no_grad()
-def estimate_loss(model):
-    model.eval()
-    ...
-    model.train()
+你可能会疑惑：`estimate_loss` 里面也调用了 `model(xb, yb)` 算 cross_entropy loss，这不是训练才用的吗？
+
+其实 cross_entropy 只是一把**尺子**——训练和评估都用同一把尺子量，区别在于**量完之后做不做纠正**：
+
+```
+训练时（训练循环里）：
+  loss = model(xb, yb)    ← 用尺子量一下，发现偏了
+  loss.backward()          ← 算出"往哪个方向纠正"
+  optimizer.step()         ← 动手纠正参数
+  → 量完之后改了模型
+
+评估时（estimate_loss 里）：
+  loss = model(xb, yb)    ← 用同一把尺子量一下
+  losses[k] = loss.item() ← 把分数记在本子上
+  （没有 backward，没有 step）
+  → 量完之后什么都没改，只是看看分数
 ```
 
-这三行代码做的事情很好理解：
+所以 `estimate_loss` 就是一场"模拟考试"——用和训练一样的评分标准，但只看成绩、不改试卷。它还有三层保险确保"只看不动"：
 
-- `@torch.no_grad()`：考试的时候不需要"记笔记"（计算梯度），关掉可以省内存、跑更快
-- `model.eval()`：切到"考试模式"。考试和做作业的规则不一样——有些训练专用的功能（比如后面会学到的 Dropout）在考试时要关掉，不然成绩不准
-- `model.train()`：考完了，切回"做作业模式"继续训练
+- `@torch.no_grad()`：连梯度都不算（省内存，跑更快）
+- `model.eval()`：切到"考试模式"，关掉训练专用的功能（比如后面会学到的 Dropout）
+- 代码里根本没写 `backward()` 和 `step()`——压根不更新参数
 
 ---
 
