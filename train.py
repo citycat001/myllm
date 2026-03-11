@@ -1,67 +1,69 @@
 """
-Bigram 语言模型的训练脚本。
+语言模型的训练脚本。
 
-做的事情用一句话概括：
-  读三国演义 → 统计"每个字后面最可能跟什么字" → 把统计结果存下来
+支持训练不同类型的模型：
+  - bigram:    只看前一个字猜下一个字（最简单的基线模型）
+  - attention: 加入自注意力机制，能看到更多上下文
 
-具体步骤：
+用法：
+  uv run python train.py                        # 默认训练 bigram 模型
+  uv run python train.py --model-type attention  # 训练 attention 模型
+
+训练流程（不管哪个模型都一样）：
   1. 读取《三国演义》全文
   2. 给每个字编号（分词）
   3. 把文本分成训练集和验证集
   4. 让模型反复猜"下一个字是什么"，猜错了就纠正（训练）
   5. 把学到的结果保存成文件
   6. 试着让模型写一段话，看看效果
-
-运行：uv run python train.py
 """
 
+import argparse
 import os
 import torch
-from model import BigramLanguageModel
+from model import MODEL_REGISTRY
+
+# ======================== 命令行参数 ========================
+parser = argparse.ArgumentParser(description="训练语言模型")
+parser.add_argument(
+    "--model-type",
+    choices=list(MODEL_REGISTRY.keys()),
+    default="bigram",
+    help="模型类型（默认：bigram）",
+)
+args = parser.parse_args()
+model_type = args.model_type
+
 
 # ======================== 超参数 ========================
 # 超参数 = 训练前人为设定的参数，不是模型自己学出来的。
 # 它们决定了"怎么训练"，就像做菜时的火候和时间。
+#
+# 不同的模型需要不同的超参数 —— 好比小火炖汤和大火爆炒用的火候不同。
 
-# BATCH_SIZE：每次训练同时看多少条文本片段。
-# 好比一个学生每次做多少道练习题：
-#   1 道 = 反馈太少，学习方向容易跑偏
-#   1000 道 = 做不完（CPU 吃不消）
-#   64 道 = 刚好，既能看出规律，又不会太慢
-BATCH_SIZE = 64
+if model_type == "bigram":
+    # ----- Bigram 模型的超参数 -----
+    BATCH_SIZE = 64       # 每次训练同时看 64 条文本片段
+    BLOCK_SIZE = 8        # 每条片段 8 个字（Bigram 只看前 1 个字，这个值不太重要）
+    MAX_STEPS = 10000     # 总共训练 10000 轮
+    LEARNING_RATE = 1e-2  # 学习率 0.01（简单模型可以用大步子走）
+    N_EMBD = None         # Bigram 不需要这个参数
+else:
+    # ----- Self-Attention 模型的超参数 -----
+    BATCH_SIZE = 32       # 每次训练同时看 32 条（模型更大，一批不能太多，不然内存不够）
+    BLOCK_SIZE = 256      # 每条片段 256 个字（注意力模型能利用更长的上下文）
+    MAX_STEPS = 10000     # 总共训练 10000 轮
+    LEARNING_RATE = 1e-3  # 学习率 0.001（复杂模型需要更小的步子，不然容易"走偏"）
+    N_EMBD = 64           # 每个字用 64 维的向量表示
 
-# BLOCK_SIZE：每条训练片段有多少个字。
-# 对于 Bigram 模型来说，这个值不太重要（因为它只看前 1 个字）。
-# 设为 8 意味着每条片段能提供 8 个"猜下一个字"的练习机会。
-# 后面加了注意力机制后，这个值决定了模型能"看到"多远的上下文。
-BLOCK_SIZE = 8
-
-# MAX_STEPS：总共训练多少轮。
-# 中文有 4742 个不同字符（远比英文 26 个字母复杂），
-# 要学会这么多字之间的搭配关系，需要更多的练习次数。
-MAX_STEPS = 10000
-
-# EVAL_INTERVAL：每隔多少轮看一次成绩。
-# 就像考试不能每做一题就对答案，但也不能做完全部才看分数。
-# 每 1000 轮看一次，10000 轮里看 10 次，刚好能看到进步趋势。
-EVAL_INTERVAL = 1000
-
-# EVAL_ITERS：看成绩时用多少组题来算平均分。
-# 用 1 组题算出来的分数波动太大（可能碰巧简单或碰巧难）。
-# 平均 200 组题的分数，才能反映真实水平。
-EVAL_ITERS = 200
-
-# LEARNING_RATE：每次纠正参数时，调整的幅度有多大。
-# 好比写书法时老师帮你扶手：
-#   力度太大（0.1）= 矫枉过正，越写越歪
-#   力度太小（0.0001）= 半天没变化
-#   0.01 = 对我们这个简单模型来说刚好
-# 后面模型变复杂后，要用更小的学习率（0.001 或 0.0003），不然会"手抖"。
-LEARNING_RATE = 1e-2
-
-# DEVICE：在哪里运算。有 GPU 就用 GPU（快很多），没有就用 CPU。
+# 通用超参数
+EVAL_INTERVAL = 1000  # 每 1000 轮看一次成绩
+EVAL_ITERS = 200      # 看成绩时用 200 组题算平均分
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# =================================================================
+
+print(f"Model type: {model_type}")
+print(f"Hyperparameters: batch_size={BATCH_SIZE}, block_size={BLOCK_SIZE}, "
+      f"max_steps={MAX_STEPS}, lr={LEARNING_RATE}")
 
 
 # ======================== 加载数据 ========================
@@ -119,20 +121,20 @@ def get_batch(split: str):
 
     打个比方：
       文本 = "却说曹操引兵追赶关公到城下"
-      随机选个起点，截 8 个字：
+      随机选个起点，截 BLOCK_SIZE 个字：
         输入 x = [却, 说, 曹, 操, 引, 兵, 追, 赶]
         答案 y = [说, 曹, 操, 引, 兵, 追, 赶, 关]
       y 就是 x 往后挪一位 —— 每个位置的"正确的下一个字"。
-      这样一条样本就提供了 8 个练习：却→说、说→曹、曹→操……
+      这样一条样本就提供了 BLOCK_SIZE 个练习。
 
-    一次截 64 条这样的片段（BATCH_SIZE=64），打包在一起并行处理。
+    一次截 BATCH_SIZE 条这样的片段，打包在一起并行处理。
     """
     d = train_data if split == "train" else val_data
 
-    # 随机选 64 个起始位置（不超出文本末尾）
+    # 随机选 BATCH_SIZE 个起始位置（不超出文本末尾）
     ix = torch.randint(len(d) - BLOCK_SIZE, (BATCH_SIZE,))
 
-    # 从每个起始位置截取 8 个连续字符作为输入
+    # 从每个起始位置截取 BLOCK_SIZE 个连续字符作为输入
     x = torch.stack([d[i : i + BLOCK_SIZE] for i in ix])
 
     # 答案 = 输入向右移一位（每个位置的"正确下一个字"）
@@ -171,10 +173,13 @@ def estimate_loss(model):
 
 
 # ======================== 创建模型 ========================
-# 创建一个 Bigram 模型。
-# 对于 4742 个字符的中文词表，模型内部就是一张 4742×4742 的大表，
-# 共约 2250 万个数字需要学习。虽然听起来很多，但模型结构极其简单。
-model = BigramLanguageModel(vocab_size).to(DEVICE)
+ModelClass = MODEL_REGISTRY[model_type]
+
+if model_type == "bigram":
+    model = ModelClass(vocab_size, block_size=BLOCK_SIZE).to(DEVICE)
+else:
+    model = ModelClass(vocab_size, n_embd=N_EMBD, block_size=BLOCK_SIZE).to(DEVICE)
+
 param_count = sum(p.numel() for p in model.parameters())
 print(f"Model parameters: {param_count:,}")
 print(f"Device: {DEVICE}")
@@ -193,7 +198,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 # ======================== 训练循环 ========================
 # 训练的本质：让模型不断地做"猜下一个字"的练习，猜错了就纠正。
-# 重复 10000 次，每次的步骤：
+# 重复 MAX_STEPS 次，每次的步骤：
 #   1. 随机抽一批练习题
 #   2. 让模型猜答案，算出猜错了多少（loss）
 #   3. 算出"每个参数应该往哪个方向调"（梯度）
@@ -201,7 +206,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 print("Training...")
 for step in range(MAX_STEPS):
 
-    # 每隔 1000 轮看一次训练成绩和考试成绩
+    # 每隔 EVAL_INTERVAL 轮看一次训练成绩和考试成绩
     if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
         losses = estimate_loss(model)
         print(f"  step {step:5d} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
@@ -228,17 +233,25 @@ print("\nTraining complete!")
 
 # ======================== 保存模型 ========================
 # 把训练好的模型存到文件里，这样下次可以直接加载，不用重新训练。
-# 存了四样东西：
-#   - 模型参数（那张 4742×4742 的大表，花了好久训练出来的）
-#   - 词表大小（4742，加载时要用来重建模型结构）
+# 除了模型参数之外，还保存了：
+#   - model_type：模型类型（bigram 或 attention），加载时需要知道用哪个类
+#   - config：模型配置参数，加载时需要用它重建模型结构
 #   - 字→数字的对照表（stoi）和 数字→字的对照表（itos）
-#     这样生成文本时不需要再读原始文本文件
 #
 # 只保存参数（state_dict）而不是整个模型，好处是：
 # 即使后来改了代码里的类名，保存的文件照样能用。
-save_path = os.path.join(os.path.dirname(__file__), "bigram_model.pt")
+
+# 模型配置：加载时需要这些参数来重建模型
+config = {"vocab_size": vocab_size, "block_size": BLOCK_SIZE}
+if model_type != "bigram":
+    config["n_embd"] = N_EMBD
+
+save_filename = f"{model_type}_model.pt"
+save_path = os.path.join(os.path.dirname(__file__), save_filename)
 torch.save({
     "model_state_dict": model.state_dict(),
+    "model_type": model_type,
+    "config": config,
     "vocab_size": vocab_size,
     "stoi": stoi,
     "itos": itos,
@@ -248,8 +261,6 @@ print(f"Model saved to {save_path}")
 
 # ======================== 试着写一段话 ========================
 # 让训练好的模型从头生成 300 个字，看看效果。
-# 因为 Bigram 只看前 1 个字，所以写出来的东西大多不通顺 ——
-# 但你能看到它学会了一些字的搭配习惯（比如"曹"后面常跟"操"）。
 print("\n--- Sample generation (300 chars) ---\n")
 context = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)  # 从编号 0 的字开始
 generated = model.generate(context, max_new_tokens=300)
