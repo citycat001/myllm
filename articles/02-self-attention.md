@@ -38,6 +38,43 @@
 
 ---
 
+## 回顾数据流：Tokenization 和 Embedding 有什么变化？
+
+在讲注意力之前，先看看数据进入模型的前两步有什么"变"与"不变"。
+
+### Tokenization（分词）：完全不变
+
+本篇沿用第一篇的**字符级分词**——每个字符一个 token，"曹操" → [1038, 2893]。分词器和词表都和 Bigram 一模一样，后面到第 5 步才会升级为 BPE 分词。所以 `train.py` 里的分词代码原封不动。
+
+### Token Embedding（词嵌入）：维度变了
+
+这一步是关键变化。回忆一下 Bigram 模型的 Embedding：
+
+```python
+# Bigram：Embedding(4742, 4742)
+# 输入一个字的编号 → 直接输出 4742 维的打分向量（就是对下一个字的预测）
+self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+```
+
+Bigram 的 Embedding 做了两件事合一：既是"字→向量"的转换，也直接当作"对下一个字的预测打分"。所以它的输出维度必须等于 vocab_size（4742），这样每个维度才能对应一个候选字的分数。
+
+Self-Attention 模型把这两件事拆开了：
+
+```python
+# Self-Attention：Embedding(4742, 64)
+# 输入一个字的编号 → 输出 64 维的"特征向量"（不是最终打分，只是中间表示）
+self.token_embedding_table = nn.Embedding(vocab_size, n_embd)  # n_embd = 64
+
+# 最终打分由单独的输出层完成：
+self.lm_head = nn.Linear(n_embd, vocab_size)  # 64 维 → 4742 维打分
+```
+
+为什么要拆开？因为中间要插入注意力层。如果 Embedding 直接输出 4742 维的打分，注意力层就得在 4742 维的空间里做 Q/K/V 计算——参数量爆炸，效率极低。用一个小得多的中间维度（64 维），注意力计算就轻松多了，最后再用一个线性层把 64 维映射回 4742 维做预测。
+
+打个比方：Bigram 就像一个人直接用答题卡（4742 个选项）来思考——笨重但简单。Self-Attention 则是先在草稿纸（64 维）上想清楚，最后再填到答题卡上——中间的"想"的过程（注意力）就在这张小草稿纸上完成。
+
+---
+
 ## Self-Attention 直觉：一场"圆桌会议"
 
 想象你是一个编辑，要在一篇文章中理解每个字的含义。你让文本中的每个字都坐在一张圆桌旁"开会"：
