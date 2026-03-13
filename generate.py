@@ -2,23 +2,23 @@
 用训练好的模型生成文本。
 
 加载之前训练保存的模型文件，给它一个开头（或者不给），
-让它自己往下写。
+让它自己往下写。支持所有类型的模型（bigram、attention 等）。
 
 用法：
-    uv run python generate.py                              # 从头开始写
-    uv run python generate.py --prompt "却说曹操" --length 200  # 从"却说曹操"接着写
+    uv run python generate.py                                        # 加载 bigram 模型，从头写
+    uv run python generate.py --model attention_model.pt             # 加载 attention 模型
+    uv run python generate.py --prompt "却说曹操" --length 200       # 从"却说曹操"接着写 200 字
 """
 
 import argparse
 import os
 import torch
-from model import BigramLanguageModel
+from model import MODEL_REGISTRY
 
 
 def main():
     # ======================== 解析命令行参数 ========================
-    # 让用户可以通过命令行指定开头文字、生成长度等。
-    parser = argparse.ArgumentParser(description="用训练好的 Bigram 模型生成文本")
+    parser = argparse.ArgumentParser(description="用训练好的模型生成文本")
     parser.add_argument("--model", default="bigram_model.pt",
                         help="模型文件路径（默认：bigram_model.pt）")
     parser.add_argument("--prompt", default="",
@@ -28,10 +28,6 @@ def main():
     args = parser.parse_args()
 
     # ======================== 加载模型文件 ========================
-    # 模型文件里存了四样东西（训练时保存的）：
-    #   - 训练好的参数（那张大表）
-    #   - 词表大小（多少个不同字符）
-    #   - 字→数字 和 数字→字 的对照表
     model_path = os.path.join(os.path.dirname(__file__), args.model)
     if not os.path.exists(model_path):
         print(f"Error: No model found at {model_path}")
@@ -39,7 +35,6 @@ def main():
         return
 
     # weights_only=False：因为文件里不光有模型参数，还有字典（对照表）。
-    # 默认模式只能加载纯参数，加这个选项才能加载字典。
     checkpoint = torch.load(model_path, weights_only=False)
     vocab_size = checkpoint["vocab_size"]
     stoi = checkpoint["stoi"]  # 字 → 数字
@@ -52,30 +47,27 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ======================== 重建模型 ========================
-    # 先建一个空模型（结构和训练时一样），再把训练好的参数填进去。
-    # model.eval() = 切到"使用模式"（关闭训练专用功能）。
-    model = BigramLanguageModel(vocab_size).to(device)
+    # 从 checkpoint 中读取模型类型和配置参数，自动选择正确的模型类。
+    # 这样不管训练时用的是 bigram 还是 attention，加载时都能正确重建。
+    model_type = checkpoint.get("model_type", "bigram")
+    config = checkpoint.get("config", {"vocab_size": vocab_size})
+
+    ModelClass = MODEL_REGISTRY[model_type]
+    model = ModelClass(**config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    model.eval()  # 切到"使用模式"（关闭训练专用功能）
+
+    print(f"Loaded {model_type} model from {args.model}")
 
     # ======================== 准备开头文字 ========================
     if args.prompt:
-        # 用户给了开头，比如"却说曹操" → 转成数字 [xx, xx, xx, xx]
-        # 外面套一层列表，把形状从 (4,) 变成 (1, 4)，即"1 条序列，4 个字"。
-        # 为什么要套？因为 forward() 的输入格式是 (B, T)，必须有 batch 维度。
-        # 训练时 B=64（一批 64 条样本），生成时 B=1（只有我们这一条序列），
-        # 但不管 B 是多少，模型用的是同一套逻辑——就像餐厅后厨不管几桌点菜，
-        # 出餐流程都一样。
         context = torch.tensor([encode(args.prompt)], dtype=torch.long, device=device)
     else:
-        # 没给开头 → 从编号 0 的字符开始（通常是换行或空格），形状 (1, 1)
+        # 没给开头 → 从编号 0 的字符开始，形状 (1, 1)
         context = torch.zeros((1, 1), dtype=torch.long, device=device)
 
     # ======================== 生成文本 ========================
-    # 模型会从开头接着写，每次写一个字，写够指定的长度。
     generated = model.generate(context, max_new_tokens=args.length)
-
-    # generated 是数字序列，用 decode 变回文字再打印出来。
     print(decode(generated[0].tolist()))
 
 
