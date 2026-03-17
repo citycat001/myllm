@@ -193,18 +193,28 @@ class Head(nn.Module):
     def __init__(self, n_embd: int, head_size: int, block_size: int):
         """
         参数：
-            n_embd:     输入向量的维度（每个字用多少个数字表示）
-            head_size:  这个注意力头的输出维度
+            n_embd:     输入向量的维度（每个字用多少个数字表示）。
+                        注意：传进来的 x 已经是 token embedding + position embedding 相加后的结果，
+                        不是两个分开的向量。相加发生在 SelfAttentionLanguageModel.forward() 里。
+            head_size:  这个注意力头的输出维度（Q、K、V 被投影到多大的空间）。
+                        当前 head_size = n_embd = 64，所以输入输出维度一样大。
+                        后面做多头注意力时，head_size 会变小（比如 4 个头，每头 64/4=16）。
             block_size: 最大上下文长度（决定因果遮罩的大小）
         """
         super().__init__()
 
-        # Q、K、V 三个投影矩阵。
+        # Q、K、V 三个投影矩阵（对应文章中的 W_q、W_k、W_v）。
         # 它们把每个字的向量（n_embd 维）投影到 head_size 维的空间里。
+        # 三个矩阵的输入都是同一个 x，但各自学到不同的变换：
+        #   - query（W_q）：提取"我在找什么信息"（圆桌会议中的"提问"）
+        #   - key  （W_k）：提取"我能提供什么信息"（圆桌会议中的"标签牌"）
+        #   - value（W_v）：提取"我的实际语义内容"（圆桌会议中的"资料"）
+        # 比喻：x 是完整简历，W_q/W_k/W_v 是三个不同的筛选器，
+        #       分别从简历中挑出"你想问什么"、"你的标签"、"你的干货"。
         # 不用偏置（bias=False）是 Transformer 的惯例 —— 实验表明去掉偏置效果差不多，还能少点参数。
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)  # W_q: (n_embd, head_size)
+        self.key = nn.Linear(n_embd, head_size, bias=False)    # W_k: (n_embd, head_size)
+        self.value = nn.Linear(n_embd, head_size, bias=False)  # W_v: (n_embd, head_size)
 
         # 因果遮罩（Causal Mask）—— 一个下三角矩阵。
         # 作用：保证每个位置只能看到自己和前面的字，不能"偷看"后面的字。
@@ -227,11 +237,15 @@ class Head(nn.Module):
         """
         B, T, C = x.shape
 
-        # 第 1 步：计算 Q、K、V
-        # 每个字的向量经过三个不同的线性变换，得到"提问"、"标签"、"内容"三种表示
-        q = self.query(x)  # (B, T, head_size)
-        k = self.key(x)    # (B, T, head_size)
-        v = self.value(x)  # (B, T, head_size)
+        # 第 1 步：计算 Q、K、V（对应文章中 V = Embedding × W_v，Q 和 K 同理）
+        # 每个字的向量 x 经过三个不同的线性变换（矩阵乘法），得到三种不同的表示：
+        #   q = x × W_q → "我在找什么信息"
+        #   k = x × W_k → "我能提供什么信息"
+        #   v = x × W_v → "我的实际语义内容"（别的字来参考我时，拿到的就是这个）
+        # 注意：x 已经融合了字义和位置信息（tok_emb + pos_emb），所以 Q/K/V 天然包含位置感知。
+        q = self.query(x)  # (B, T, head_size) — 每个字的"提问"
+        k = self.key(x)    # (B, T, head_size) — 每个字的"标签牌"
+        v = self.value(x)  # (B, T, head_size) — 每个字的"语义资料"
 
         # 第 2 步：计算注意力分数 —— Q 和 K 的点积
         # 点积越大，说明两个字越"相关"。
@@ -300,8 +314,10 @@ class SelfAttentionLanguageModel(BaseLanguageModel):
         # 这些向量会和字的向量相加，让模型知道"这个字在第几个位置"。
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
 
-        # 自注意力头：让每个字能"看到"前面的字
-        # head_size = n_embd，意味着注意力输出的维度和输入一样
+        # 自注意力头：让每个字能"看到"前面的字（文章中的"圆桌会议"）
+        # 参数说明：Head(输入维度=64, 输出维度=64, 最大上下文长度=256)
+        # 输入维度 = 输出维度 = n_embd，这是当前的简单设计。
+        # Head 内部会创建 W_q、W_k、W_v 三个矩阵，各自从输入中提取不同的信息。
         self.sa_head = Head(n_embd, n_embd, block_size)
 
         # 输出层：把注意力处理后的向量（n_embd 维）映射回词表大小（vocab_size 维）
@@ -332,7 +348,9 @@ class SelfAttentionLanguageModel(BaseLanguageModel):
             torch.arange(T, device=idx.device)
         )  # (T, n_embd)
 
-        # 第 3 步：字向量 + 位置向量
+        # 第 3 步：字向量 + 位置向量 → 融合后的向量
+        # 相加后，x 同时包含了"我是哪个字"和"我在第几个位置"两种信息。
+        # 后面 Head 里的 Q/K/V 变换接收的就是这个融合后的 x，不是分开的两个向量。
         # 为什么用加法而不是拼接？因为加法更简单高效，而且实验表明效果一样好。
         # pos_emb 形状是 (T, n_embd)，会自动广播到 (B, T, n_embd)。
         x = tok_emb + pos_emb  # (B, T, n_embd)
