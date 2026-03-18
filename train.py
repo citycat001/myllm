@@ -2,16 +2,20 @@
 语言模型的训练脚本。
 
 支持训练不同类型的模型：
-  - bigram:    只看前一个字猜下一个字（最简单的基线模型）
-  - attention: 加入自注意力机制，能看到更多上下文
+  - bigram:        只看前一个字猜下一个字（最简单的基线模型）
+  - attention:     加入自注意力机制，能看到更多上下文
+  - attention_ffn: 单头注意力 + 前馈网络
+  - multihead:     多头注意力
+  - multihead_ffn: 多头注意力 + 前馈网络
 
 用法：
-  uv run python train.py                        # 默认训练 bigram 模型
-  uv run python train.py --model-type attention  # 训练 attention 模型
+  uv run python train.py                              # 默认训练 bigram 模型
+  uv run python train.py --model-type attention        # 训练 attention 模型
+  uv run python train.py --model-type multihead_ffn    # 训练多头+FFN 模型
 
 训练流程（不管哪个模型都一样）：
   1. 读取《三国演义》全文
-  2. 给每个字编号（分词）
+  2. 用分词器给每个字编号
   3. 把文本分成训练集和验证集
   4. 让模型反复猜"下一个字是什么"，猜错了就纠正（训练）
   5. 把学到的结果保存成文件
@@ -21,7 +25,8 @@
 import argparse
 import os
 import torch
-from model import MODEL_REGISTRY
+from model import MODEL_REGISTRY, build_embedding, build_blocks
+from tokenizer import CharTokenizer
 
 # ======================== 命令行参数 ========================
 parser = argparse.ArgumentParser(description="训练语言模型")
@@ -40,21 +45,61 @@ model_type = args.model_type
 # 它们决定了"怎么训练"，就像做菜时的火候和时间。
 #
 # 不同的模型需要不同的超参数 —— 好比小火炖汤和大火爆炒用的火候不同。
+# 用字典统一管理所有模型的超参数，方便扩展新模型。
 
-if model_type == "bigram":
-    # ----- Bigram 模型的超参数 -----
-    BATCH_SIZE = 64       # 每次训练同时看 64 条文本片段
-    BLOCK_SIZE = 8        # 每条片段 8 个字（Bigram 只看前 1 个字，这个值不太重要）
-    MAX_STEPS = 10000     # 总共训练 10000 轮
-    LEARNING_RATE = 1e-2  # 学习率 0.01（简单模型可以用大步子走）
-    N_EMBD = None         # Bigram 不需要这个参数
-else:
-    # ----- Self-Attention 模型的超参数 -----
-    BATCH_SIZE = 32       # 每次训练同时看 32 条（模型更大，一批不能太多，不然内存不够）
-    BLOCK_SIZE = 256      # 每条片段 256 个字（注意力模型能利用更长的上下文）
-    MAX_STEPS = 10000     # 总共训练 10000 轮
-    LEARNING_RATE = 1e-3  # 学习率 0.001（复杂模型需要更小的步子，不然容易"走偏"）
-    N_EMBD = 64           # 每个字用 64 维的向量表示
+MODEL_CONFIGS = {
+    "bigram": {
+        "batch_size": 64,       # 每次训练同时看 64 条文本片段
+        "block_size": 8,        # 每条片段 8 个字（Bigram 只看前 1 个字，这个值不太重要）
+        "max_steps": 10000,     # 总共训练 10000 轮
+        "lr": 1e-2,             # 学习率 0.01（简单模型可以用大步子走）
+    },
+    "attention": {
+        "batch_size": 32,       # 模型更大，一批不能太多，不然内存不够
+        "block_size": 256,      # 注意力模型能利用更长的上下文
+        "max_steps": 10000,
+        "lr": 1e-3,             # 复杂模型需要更小的步子，不然容易"走偏"
+        "n_embd": 64,           # 每个字用 64 维的向量表示
+    },
+    "attention_ffn": {
+        "batch_size": 32,
+        "block_size": 256,
+        "max_steps": 10000,
+        "lr": 1e-3,
+        "n_embd": 64,
+        "n_head": 1,                                # 单头注意力
+        "embedding_type": "token_position",          # 嵌入插件：字 + 位置
+        "block_names": ["attention", "ffn"],         # 积木组合：注意力 + 前馈网络
+    },
+    "multihead": {
+        "batch_size": 32,
+        "block_size": 256,
+        "max_steps": 10000,
+        "lr": 1e-3,
+        "n_embd": 64,
+        "n_head": 4,                                # 4 头注意力
+        "embedding_type": "token_position",          # 嵌入插件：字 + 位置
+        "block_names": ["attention"],                # 积木组合：仅多头注意力
+    },
+    "multihead_ffn": {
+        "batch_size": 32,
+        "block_size": 256,
+        "max_steps": 10000,
+        "lr": 1e-3,
+        "n_embd": 64,
+        "n_head": 4,                                # 4 头注意力
+        "embedding_type": "token_position",          # 嵌入插件：字 + 位置
+        "block_names": ["attention", "ffn"],         # 积木组合：多头注意力 + 前馈网络
+    },
+}
+
+cfg = MODEL_CONFIGS[model_type]
+BATCH_SIZE = cfg["batch_size"]
+BLOCK_SIZE = cfg["block_size"]
+MAX_STEPS = cfg["max_steps"]
+LEARNING_RATE = cfg["lr"]
+N_EMBD = cfg.get("n_embd")
+N_HEAD = cfg.get("n_head")
 
 # 通用超参数
 EVAL_INTERVAL = 1000  # 每 1000 轮看一次成绩
@@ -69,36 +114,27 @@ print(f"Hyperparameters: batch_size={BATCH_SIZE}, block_size={BLOCK_SIZE}, "
 # ======================== 加载数据 ========================
 # 读取《三国演义》全文，约 60 万字。
 data_path = os.path.join(os.path.dirname(__file__), "data", "input.txt")
-with open(data_path, "r") as f:
+with open(data_path, "r", encoding="utf-8") as f:
     text = f.read()
 
 
-# ======================== 字符级分词器 ========================
+# ======================== 分词器 ========================
 # 电脑不认字，只认数字。所以第一步是给每个字编个号。
+# 分词器（Tokenizer）就是负责"文字 ↔ 数字"互相转换的工具。
 #
-# 做法很简单：
-#   1. 找出文本里所有不重复的字符（排序保证每次结果一样）
-#   2. 按顺序编号：第 0 个字符编号 0，第 1 个编号 1……
-#   3. 制作两张对照表：字→数字（stoi），数字→字（itos）
-#
-# 这是最原始的分词方式：一个字 = 一个 token。
-# 后面会学更聪明的分词方法（BPE），能把常见的词组合并成一个 token。
+# 当前使用字符级分词器（CharTokenizer）：一个字 = 一个 token。
+# 后面第 5 步会升级为 BPE 分词器，到时候只需要换一个 Tokenizer 类，
+# 下面的 encode/decode 调用代码完全不用改。
 
-chars = sorted(set(text))
-vocab_size = len(chars)  # 三国演义里共有 4742 个不同字符
+tokenizer = CharTokenizer.from_text(text)
+vocab_size = tokenizer.vocab_size  # 三国演义里共有 4742 个不同字符
 print(f"Vocabulary size: {vocab_size} unique characters")
-
-stoi = {ch: i for i, ch in enumerate(chars)}  # "曹" → 1038
-itos = {i: ch for i, ch in enumerate(chars)}  # 1038 → "曹"
-
-encode = lambda s: [stoi[c] for c in s]        # "曹操" → [1038, 2893]
-decode = lambda l: "".join([itos[i] for i in l])  # [1038, 2893] → "曹操"
 
 
 # ======================== 编码数据集 ========================
 # 把整篇文章从文字变成数字序列，存成 PyTorch 张量。
 # dtype=torch.long 表示用整数（因为编号是整数）。
-data = torch.tensor(encode(text), dtype=torch.long)
+data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
 print(f"Dataset: {len(data):,} tokens")
 
 
@@ -176,9 +212,17 @@ def estimate_loss(model):
 ModelClass = MODEL_REGISTRY[model_type]
 
 if model_type == "bigram":
+    # Bigram 只需要 vocab_size
     model = ModelClass(vocab_size, block_size=BLOCK_SIZE).to(DEVICE)
-else:
+elif model_type == "attention":
+    # 原始的单头注意力模型（保留用于对比）
     model = ModelClass(vocab_size, n_embd=N_EMBD, block_size=BLOCK_SIZE).to(DEVICE)
+else:
+    # 组装式模型：根据配置动态创建嵌入插件和 Block 列表
+    embedding = build_embedding(cfg["embedding_type"], vocab_size, N_EMBD, BLOCK_SIZE)
+    blocks = build_blocks(cfg["block_names"], N_EMBD, N_HEAD, BLOCK_SIZE)
+    model = ModelClass(vocab_size, n_embd=N_EMBD, block_size=BLOCK_SIZE,
+                       embedding=embedding, blocks=blocks).to(DEVICE)
 
 param_count = sum(p.numel() for p in model.parameters())
 print(f"Model parameters: {param_count:,}")
@@ -242,9 +286,15 @@ print("\nTraining complete!")
 # 即使后来改了代码里的类名，保存的文件照样能用。
 
 # 模型配置：加载时需要这些参数来重建模型
+# 根据模型类型动态构建 config，只包含该模型需要的参数
 config = {"vocab_size": vocab_size, "block_size": BLOCK_SIZE}
-if model_type != "bigram":
+if N_EMBD is not None:
     config["n_embd"] = N_EMBD
+if "block_names" in cfg:
+    # 组装式模型：保存嵌入类型、积木组合和头数，加载时重建
+    config["embedding_type"] = cfg["embedding_type"]
+    config["n_head"] = N_HEAD
+    config["block_names"] = cfg["block_names"]
 
 save_filename = f"{model_type}_model.pt"
 save_path = os.path.join(os.path.dirname(__file__), save_filename)
@@ -253,8 +303,10 @@ torch.save({
     "model_type": model_type,
     "config": config,
     "vocab_size": vocab_size,
-    "stoi": stoi,
-    "itos": itos,
+    "tokenizer": tokenizer.to_dict(),
+    # 兼容旧版本：同时保存 stoi/itos，这样旧的 generate.py 也能加载
+    "stoi": tokenizer.stoi,
+    "itos": tokenizer.itos,
 }, save_path)
 print(f"Model saved to {save_path}")
 
@@ -264,4 +316,4 @@ print(f"Model saved to {save_path}")
 print("\n--- Sample generation (300 chars) ---\n")
 context = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)  # 从编号 0 的字开始
 generated = model.generate(context, max_new_tokens=300)
-print(decode(generated[0].tolist()))  # 把数字序列变回文字
+print(tokenizer.decode(generated[0].tolist()))  # 把数字序列变回文字
