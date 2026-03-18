@@ -11,8 +11,7 @@ BaseLanguageModel (nn.Module)        ← 共享接口：forward() + generate()
 │   └── Head                         ← 单头自注意力（Q/K/V + 因果遮罩）
 └── AssembledModel                   ← 积木式模型，通过 Block 列表自由组装
     ├── AttentionBlock               ← 注意力插件（LayerNorm + 注意力 + 残差）
-    │   ├── Head                     ← n_head=1 时用单头
-    │   └── MultiHeadAttention       ← n_head>1 时用多头
+    │   └── MultiHeadAttention       ← 统一使用多头注意力（n_head=1 也走此路径）
     │       └── Head × n_head        ← 多个独立的注意力头
     └── FFNBlock                     ← 前馈网络插件（LayerNorm + FFN + 残差）
         └── FeedForward              ← 两层 MLP（展开→ReLU→压缩）
@@ -33,7 +32,7 @@ Block 组装示例：
   - `CharTokenizer`: Character-level tokenizer (one char = one token). Supports `encode`/`decode`/`to_dict`/`from_dict`.
   - `load_tokenizer()`: Restores a tokenizer from checkpoint data.
   - `TOKENIZER_REGISTRY`: Dict mapping tokenizer type names to classes.
-- **model.py** — All model classes and组件:
+- **model.py** — All model classes and components:
   - `BaseLanguageModel`: Abstract base with shared `generate()` method
   - `BigramLanguageModel`: A single `nn.Embedding(vocab_size, vocab_size)` table. Each token looks up a row of logits for the next token.
   - `Head`: Single self-attention head with Q/K/V projections and causal mask.

@@ -58,16 +58,23 @@ def main():
     ModelClass = MODEL_REGISTRY[model_type]
     if "block_names" in config:
         # 组装式模型：根据配置重建嵌入插件和 Block 列表
-        block_names = config.pop("block_names")
-        embedding_type = config.pop("embedding_type")
-        n_head = config.pop("n_head")
-        config["embedding"] = build_embedding(
-            embedding_type, config["vocab_size"], config["n_embd"], config["block_size"]
-        )
-        config["blocks"] = build_blocks(
-            block_names, config["n_embd"], n_head, config["block_size"]
-        )
-    model = ModelClass(**config).to(device)
+        # 从 config 中读取组装参数，然后构建独立的 model_kwargs（不修改原始 config）
+        model_kwargs = {
+            "vocab_size": config["vocab_size"],
+            "n_embd": config["n_embd"],
+            "block_size": config["block_size"],
+            "embedding": build_embedding(
+                config["embedding_type"], config["vocab_size"],
+                config["n_embd"], config["block_size"]
+            ),
+            "blocks": build_blocks(
+                config["block_names"], config["n_embd"],
+                config["n_head"], config["block_size"]
+            ),
+        }
+    else:
+        model_kwargs = config
+    model = ModelClass(**model_kwargs).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()  # 切到"使用模式"（关闭训练专用功能）
 

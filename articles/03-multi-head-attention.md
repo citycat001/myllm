@@ -123,7 +123,7 @@ class FeedForward(nn.Module):
 
 **为什么先展开再压缩？** 就像写笔记——先在草稿纸上展开思路（256 维的空间有更多"余地"去发现规律），然后把要点浓缩成简洁的结论（回到 64 维）。4 倍的展开比例是 Transformer 原始论文的经验值。
 
-**为什么需要 ReLU？** 如果只有线性层（矩阵乘法），不管叠多少层，数学上等价于一层。ReLU 引入了非线性——负数变 0，正数保持不变——这让模型能学到"有就有，没有就没有"的硬判断，大大增强了表达能力。
+**为什么需要 ReLU？** 如果只有线性层（矩阵乘法），不管叠多少层，数学上等价于一层。ReLU 引入了非线性——负数变 0，正数保持不变——这让模型能学到"有就有，没有就没有"的硬判断，大大增强了表达能力。（注：GPT-2 以后的模型通常使用 GELU 激活函数，它比 ReLU 更"平滑"，我们先用 ReLU 保持简单易懂。）
 
 **FFN 的独立性**：注意 FFN 对每个字**独立**处理（不看其他字），它的输入和输出都是 `(B, T, n_embd)`。这意味着它完全不依赖注意力层，可以和**任何注意力配置**搭配使用。
 
@@ -194,17 +194,15 @@ class AttentionBlock(nn.Module):
     def __init__(self, n_embd, n_head, block_size):
         super().__init__()
         self.ln = nn.LayerNorm(n_embd)
-        if n_head == 1:
-            self.attn = Head(n_embd, n_embd, block_size)     # 单头
-        else:
-            head_size = n_embd // n_head
-            self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)  # 多头
+        # 统一使用 MultiHeadAttention，n_head=1 就是"只有一个头的多头注意力"
+        head_size = n_embd // n_head
+        self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)
 
     def forward(self, x):
         return x + self.attn(self.ln(x))   # 残差 + LayerNorm + 注意力
 ```
 
-`n_head=1` 自动用单头，`n_head=4` 自动用多头。对外接口完全一样。
+不管 `n_head=1` 还是 `n_head=4`，都走同一条路径（MultiHeadAttention），对外接口完全一样。这样单头和多头的结构完全对称（都有投影层），对比实验更公平。
 
 ### FFNBlock：前馈网络积木
 
@@ -240,6 +238,7 @@ class AssembledModel(BaseLanguageModel):
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
+        B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))
         x = tok_emb + pos_emb
@@ -268,6 +267,8 @@ blocks = [AttentionBlock(64, n_head=4, block_size=256), FFNBlock(64)]
 ```
 
 只要改变 Block 列表，就能得到完全不同的模型！
+
+**注意**：本篇的配置都只用了 **1 层** Block（一个 AttentionBlock + 一个 FFNBlock）。真正的 Transformer 是把这对组合**堆叠 N 层**。下一篇（Mini-GPT）我们会把积木"叠高"，你会看到多层堆叠带来的显著提升。
 
 ### build_blocks：积木的组装说明书
 
@@ -454,6 +455,6 @@ CharTokenizer（分词插件，在模型外部）
 
 ---
 
-*代码仓库：[GitHub 链接]*
+*代码仓库：[GitHub](https://github.com/citycat001/myllm)*
 *使用的技术栈：Python 3.10 + PyTorch + uv*
 *训练数据：《三国演义》全文（~60 万字符）*

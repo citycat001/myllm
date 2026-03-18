@@ -468,13 +468,10 @@ class AttentionBlock(nn.Module):
         """
         super().__init__()
         self.ln = nn.LayerNorm(n_embd)
-        if n_head == 1:
-            # 单头：直接用 Head，和第 2 步的实现一样
-            self.attn = Head(n_embd, n_embd, block_size)
-        else:
-            # 多头：每个头分到 n_embd // n_head 维的思考空间
-            head_size = n_embd // n_head
-            self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)
+        # 统一使用 MultiHeadAttention，即使 n_head=1 也走同一条路径。
+        # 这样单头和多头的结构完全对称（都有投影层），对比实验更公平。
+        head_size = n_embd // n_head
+        self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Pre-Norm 架构：先归一化，再做注意力，最后加上残差

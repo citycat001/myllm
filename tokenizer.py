@@ -76,7 +76,10 @@ class CharTokenizer:
     @classmethod
     def from_dict(cls, data: dict) -> "CharTokenizer":
         """从字典恢复，用于从 checkpoint 加载。"""
-        return cls(data["stoi"], data["itos"])
+        # itos 的 key 应该是 int，但 JSON 序列化会把 int key 变成 str，
+        # 这里做一次转换确保兼容性。
+        itos = {int(k): v for k, v in data["itos"].items()}
+        return cls(data["stoi"], itos)
 
 
 # ======================== 分词器注册表 ========================
