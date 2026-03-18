@@ -114,7 +114,7 @@ print(f"Hyperparameters: batch_size={BATCH_SIZE}, block_size={BLOCK_SIZE}, "
 # ======================== 加载数据 ========================
 # 读取《三国演义》全文，约 60 万字。
 data_path = os.path.join(os.path.dirname(__file__), "data", "input.txt")
-with open(data_path, "r") as f:
+with open(data_path, "r", encoding="utf-8") as f:
     text = f.read()
 
 
