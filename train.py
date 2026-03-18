@@ -21,7 +21,7 @@
 import argparse
 import os
 import torch
-from model import MODEL_REGISTRY
+from model import MODEL_REGISTRY, AssembledModel, build_blocks
 
 # ======================== 命令行参数 ========================
 parser = argparse.ArgumentParser(description="训练语言模型")
@@ -40,21 +40,58 @@ model_type = args.model_type
 # 它们决定了"怎么训练"，就像做菜时的火候和时间。
 #
 # 不同的模型需要不同的超参数 —— 好比小火炖汤和大火爆炒用的火候不同。
+# 用字典统一管理所有模型的超参数，方便扩展新模型。
 
-if model_type == "bigram":
-    # ----- Bigram 模型的超参数 -----
-    BATCH_SIZE = 64       # 每次训练同时看 64 条文本片段
-    BLOCK_SIZE = 8        # 每条片段 8 个字（Bigram 只看前 1 个字，这个值不太重要）
-    MAX_STEPS = 10000     # 总共训练 10000 轮
-    LEARNING_RATE = 1e-2  # 学习率 0.01（简单模型可以用大步子走）
-    N_EMBD = None         # Bigram 不需要这个参数
-else:
-    # ----- Self-Attention 模型的超参数 -----
-    BATCH_SIZE = 32       # 每次训练同时看 32 条（模型更大，一批不能太多，不然内存不够）
-    BLOCK_SIZE = 256      # 每条片段 256 个字（注意力模型能利用更长的上下文）
-    MAX_STEPS = 10000     # 总共训练 10000 轮
-    LEARNING_RATE = 1e-3  # 学习率 0.001（复杂模型需要更小的步子，不然容易"走偏"）
-    N_EMBD = 64           # 每个字用 64 维的向量表示
+MODEL_CONFIGS = {
+    "bigram": {
+        "batch_size": 64,       # 每次训练同时看 64 条文本片段
+        "block_size": 8,        # 每条片段 8 个字（Bigram 只看前 1 个字，这个值不太重要）
+        "max_steps": 10000,     # 总共训练 10000 轮
+        "lr": 1e-2,             # 学习率 0.01（简单模型可以用大步子走）
+    },
+    "attention": {
+        "batch_size": 32,       # 模型更大，一批不能太多，不然内存不够
+        "block_size": 256,      # 注意力模型能利用更长的上下文
+        "max_steps": 10000,
+        "lr": 1e-3,             # 复杂模型需要更小的步子，不然容易"走偏"
+        "n_embd": 64,           # 每个字用 64 维的向量表示
+    },
+    "attention_ffn": {
+        "batch_size": 32,
+        "block_size": 256,
+        "max_steps": 10000,
+        "lr": 1e-3,
+        "n_embd": 64,
+        "n_head": 1,                        # 单头注意力
+        "block_names": ["attention", "ffn"], # 积木组合：注意力 + 前馈网络
+    },
+    "multihead": {
+        "batch_size": 32,
+        "block_size": 256,
+        "max_steps": 10000,
+        "lr": 1e-3,
+        "n_embd": 64,
+        "n_head": 4,                        # 4 头注意力
+        "block_names": ["attention"],        # 积木组合：仅多头注意力
+    },
+    "multihead_ffn": {
+        "batch_size": 32,
+        "block_size": 256,
+        "max_steps": 10000,
+        "lr": 1e-3,
+        "n_embd": 64,
+        "n_head": 4,                        # 4 头注意力
+        "block_names": ["attention", "ffn"], # 积木组合：多头注意力 + 前馈网络
+    },
+}
+
+cfg = MODEL_CONFIGS[model_type]
+BATCH_SIZE = cfg["batch_size"]
+BLOCK_SIZE = cfg["block_size"]
+MAX_STEPS = cfg["max_steps"]
+LEARNING_RATE = cfg["lr"]
+N_EMBD = cfg.get("n_embd")
+N_HEAD = cfg.get("n_head")
 
 # 通用超参数
 EVAL_INTERVAL = 1000  # 每 1000 轮看一次成绩
@@ -176,9 +213,17 @@ def estimate_loss(model):
 ModelClass = MODEL_REGISTRY[model_type]
 
 if model_type == "bigram":
+    # Bigram 只需要 vocab_size
     model = ModelClass(vocab_size, block_size=BLOCK_SIZE).to(DEVICE)
-else:
+elif model_type == "attention":
+    # 原始的单头注意力模型（保留用于对比）
     model = ModelClass(vocab_size, n_embd=N_EMBD, block_size=BLOCK_SIZE).to(DEVICE)
+else:
+    # 组装式模型：根据配置中的 block_names 动态创建 Block 列表
+    block_names = cfg["block_names"]
+    blocks = build_blocks(block_names, N_EMBD, N_HEAD, BLOCK_SIZE)
+    model = ModelClass(vocab_size, n_embd=N_EMBD, block_size=BLOCK_SIZE,
+                       blocks=blocks).to(DEVICE)
 
 param_count = sum(p.numel() for p in model.parameters())
 print(f"Model parameters: {param_count:,}")
@@ -242,9 +287,14 @@ print("\nTraining complete!")
 # 即使后来改了代码里的类名，保存的文件照样能用。
 
 # 模型配置：加载时需要这些参数来重建模型
+# 根据模型类型动态构建 config，只包含该模型需要的参数
 config = {"vocab_size": vocab_size, "block_size": BLOCK_SIZE}
-if model_type != "bigram":
+if N_EMBD is not None:
     config["n_embd"] = N_EMBD
+if "block_names" in cfg:
+    # 组装式模型：保存积木组合和头数，加载时用 build_blocks 重建
+    config["n_head"] = N_HEAD
+    config["block_names"] = cfg["block_names"]
 
 save_filename = f"{model_type}_model.pt"
 save_path = os.path.join(os.path.dirname(__file__), save_filename)

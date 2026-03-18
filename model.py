@@ -1,10 +1,18 @@
 """
-语言模型家族 —— 从 Bigram 到 Self-Attention。
+语言模型家族 —— 从 Bigram 到可组装的 Transformer。
 
 这个文件包含了所有模型的实现：
   - BaseLanguageModel: 所有模型的基类，定义了统一接口
   - BigramLanguageModel: 最简单的语言模型，只看前一个字猜下一个字
   - SelfAttentionLanguageModel: 加入自注意力机制，能看到更多上下文
+  - AssembledModel: 积木式模型，通过 Block 列表自由组装
+
+组件（可独立使用的积木块）：
+  - Head: 单个自注意力头
+  - FeedForward: 前馈网络（两层 MLP）
+  - MultiHeadAttention: 多头注意力（多个 Head 并行）
+  - AttentionBlock: 注意力插件（LayerNorm + 注意力 + 残差连接）
+  - FFNBlock: 前馈网络插件（LayerNorm + FFN + 残差连接）
 
 所有模型共享同一套 forward() 和 generate() 接口，
 这样 train.py 和 generate.py 不需要关心具体是哪个模型 —— 换模型就像换引擎，底盘不用动。
@@ -271,6 +279,288 @@ class Head(nn.Module):
         return out
 
 
+# ======================== 前馈网络 ========================
+
+class FeedForward(nn.Module):
+    """
+    前馈网络（Feed-Forward Network）—— 给每个字的向量做一次"深加工"。
+
+    注意力层让每个字看到了上下文（"开会讨论"），但只是做了信息汇总（加权平均）。
+    前馈网络在这个基础上，对每个字独立做一次非线性变换，增加模型的表达能力。
+
+    比喻：注意力 = 开会讨论收集信息，前馈网络 = 会后每个人独立思考、消化、总结。
+
+    结构：两层线性变换 + 中间一个 ReLU 激活函数。
+      - 第一层：把向量从 n_embd 维"展开"到 4 * n_embd 维（扩大思考空间）
+      - ReLU：非线性激活（让模型能学到复杂的模式，而不只是简单的线性关系）
+      - 第二层：把向量"压缩"回 n_embd 维（恢复原来的大小，方便后续处理）
+
+    为什么要先展开再压缩？
+    就像写笔记：先在草稿纸上展开思路（高维空间里有更多"余地"去发现规律），
+    然后把要点浓缩成简洁的结论。4 倍的展开比例是 Transformer 论文的经验值。
+    """
+
+    def __init__(self, n_embd: int):
+        """
+        参数：
+            n_embd: 输入和输出的向量维度
+        """
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),  # 展开：n_embd → 4 * n_embd
+            nn.ReLU(),                        # 非线性激活
+            nn.Linear(4 * n_embd, n_embd),   # 压缩：4 * n_embd → n_embd
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        参数：
+            x: 输入向量序列，形状 (B, T, n_embd)
+        返回：
+            处理后的向量序列，形状 (B, T, n_embd)
+        """
+        return self.net(x)
+
+
+# ======================== 多头注意力 ========================
+
+class MultiHeadAttention(nn.Module):
+    """
+    多头注意力（Multi-Head Attention）—— 同时从多个角度"开会"。
+
+    单头注意力就像一场会议只讨论一个话题；
+    多头注意力就像同时开 n_head 场平行会议，每场讨论不同的话题，最后把结论合并。
+
+    比如处理"曹操引兵追赶"时：
+      - 第 1 个头可能关注"谁发起动作"（曹操 → 引）
+      - 第 2 个头可能关注"动作和对象"（引 → 兵）
+      - 第 3 个头可能关注"事件链"（引兵 → 追赶）
+      - 第 4 个头可能关注"远距离关系"（曹操 → 追赶）
+
+    每个头的"思考空间"变小了（head_size = n_embd / n_head），
+    但多个头合在一起覆盖了更多角度，总体效果比一个大头更好。
+    最后通过一个投影层把所有头的输出合并回 n_embd 维。
+    """
+
+    def __init__(self, n_embd: int, n_head: int, head_size: int, block_size: int):
+        """
+        参数：
+            n_embd:     输入和输出的向量维度
+            n_head:     注意力头的数量（同时开几场"会议"）
+            head_size:  每个头的维度（= n_embd // n_head）
+            block_size: 最大上下文长度
+        """
+        super().__init__()
+        # 创建 n_head 个独立的注意力头，每个头有自己的 Q/K/V 矩阵
+        # 用 nn.ModuleList 而不是普通 list，这样 PyTorch 能正确管理这些头的参数
+        self.heads = nn.ModuleList([
+            Head(n_embd, head_size, block_size) for _ in range(n_head)
+        ])
+        # 投影层：把 n_head 个头的输出拼接后，映射回 n_embd 维
+        # 输入维度 = n_head * head_size = n_embd，输出维度 = n_embd
+        # 这个投影层让模型学会"如何最好地合并各个头的结论"
+        self.proj = nn.Linear(n_head * head_size, n_embd, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        参数：
+            x: 输入向量序列，形状 (B, T, n_embd)
+        返回：
+            多头注意力处理后的向量序列，形状 (B, T, n_embd)
+        """
+        # 每个头独立处理输入，各自得到 (B, T, head_size) 的输出
+        # 然后在最后一个维度上拼接：n_head 个 head_size 拼成 n_embd
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B, T, n_head * head_size)
+        # 通过投影层合并信息
+        out = self.proj(out)  # (B, T, n_embd)
+        return out
+
+
+# ======================== 可组装的 Block 插件 ========================
+
+class AttentionBlock(nn.Module):
+    """
+    注意力插件 —— 把注意力层包装成一个标准积木块。
+
+    包含三个部分：
+      1. LayerNorm：归一化，让输入的数值稳定在合理范围（防止数值爆炸或消失）
+      2. 注意力层：单头或多头，根据 n_head 自动选择
+      3. 残差连接：把注意力的输出加上原始输入（x + attention(x)）
+
+    为什么需要残差连接？
+    想象你在开会讨论一个问题：讨论完后你不会完全忘掉自己原来的想法，
+    而是把讨论得到的新信息"叠加"到原有认知上。残差连接就是这个"叠加"操作。
+    技术上说，残差连接解决了深层网络的梯度消失问题 —— 梯度可以通过"捷径"直接传回去。
+
+    为什么需要 LayerNorm？
+    每一层的输入数值范围可能差别很大，LayerNorm 把它们"拉齐"到统一的范围，
+    就像考试前先统一度量衡，这样后续计算更稳定，训练更快收敛。
+    """
+
+    def __init__(self, n_embd: int, n_head: int, block_size: int):
+        """
+        参数：
+            n_embd:     向量维度
+            n_head:     注意力头数（1 = 单头，>1 = 多头）
+            block_size: 最大上下文长度
+        """
+        super().__init__()
+        self.ln = nn.LayerNorm(n_embd)
+        if n_head == 1:
+            # 单头：直接用 Head，和第 2 步的实现一样
+            self.attn = Head(n_embd, n_embd, block_size)
+        else:
+            # 多头：每个头分到 n_embd // n_head 维的思考空间
+            head_size = n_embd // n_head
+            self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-Norm 架构：先归一化，再做注意力，最后加上残差
+        # 这是 GPT-2 以后的主流做法（比原始 Transformer 的 Post-Norm 更稳定）
+        return x + self.attn(self.ln(x))
+
+
+class FFNBlock(nn.Module):
+    """
+    前馈网络插件 —— 把 FFN 包装成一个标准积木块。
+
+    和 AttentionBlock 一样，包含 LayerNorm + FFN + 残差连接。
+    这个插件完全独立于注意力层，可以和任何 Block 自由搭配：
+      - 和单头注意力搭配：[AttentionBlock(n_head=1), FFNBlock]
+      - 和多头注意力搭配：[AttentionBlock(n_head=4), FFNBlock]
+      - 甚至可以单独使用（虽然效果不好，但技术上可行）
+    """
+
+    def __init__(self, n_embd: int):
+        """
+        参数：
+            n_embd: 向量维度
+        """
+        super().__init__()
+        self.ln = nn.LayerNorm(n_embd)
+        self.ffn = FeedForward(n_embd)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.ffn(self.ln(x))
+
+
+# ======================== 组装式模型 ========================
+
+class AssembledModel(BaseLanguageModel):
+    """
+    积木式语言模型 —— 通过 Block 列表自由组装的模型。
+
+    这个模型本身不包含任何注意力或 FFN 的实现，
+    它只负责"搭台子"（embedding + 位置编码 + 输出层），
+    中间的"表演"全部交给传入的 Block 列表。
+
+    就像一个舞台：
+      - 舞台本身（AssembledModel）提供灯光、音响等基础设施
+      - 节目内容（blocks）可以自由编排 —— 先来一段注意力，再来一段 FFN，或者任意组合
+
+    用法示例：
+      # 单头注意力 + FFN
+      blocks = [AttentionBlock(64, 1, 256), FFNBlock(64)]
+      model = AssembledModel(vocab_size, 64, 256, blocks)
+
+      # 多头注意力（无 FFN）
+      blocks = [AttentionBlock(64, 4, 256)]
+      model = AssembledModel(vocab_size, 64, 256, blocks)
+
+      # 多头注意力 + FFN（标准 Transformer Block）
+      blocks = [AttentionBlock(64, 4, 256), FFNBlock(64)]
+      model = AssembledModel(vocab_size, 64, 256, blocks)
+    """
+
+    def __init__(self, vocab_size: int, n_embd: int, block_size: int,
+                 blocks: list[nn.Module]):
+        """
+        参数：
+            vocab_size: 词表大小
+            n_embd:     嵌入维度
+            block_size: 最大上下文长度
+            blocks:     Block 列表，按顺序串联执行
+        """
+        super().__init__()
+        self.block_size = block_size
+
+        # 和 SelfAttentionLanguageModel 一样的 embedding 层
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+
+        # 把传入的 Block 列表注册为子模块
+        # nn.ModuleList 确保 PyTorch 能正确管理这些 Block 的参数
+        self.blocks = nn.ModuleList(blocks)
+
+        # 最终的 LayerNorm：在所有 Block 处理完之后做一次归一化
+        self.ln_final = nn.LayerNorm(n_embd)
+
+        # 输出层：向量 → 词表大小的打分
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        """
+        前向传播：embedding → blocks → 输出打分。
+
+        数据流动过程：
+          字 → token embedding + position embedding → block1 → block2 → ... → LayerNorm → 输出打分
+        """
+        B, T = idx.shape
+
+        # 字向量 + 位置向量（和 SelfAttentionLanguageModel 一样）
+        tok_emb = self.token_embedding_table(idx)                              # (B, T, n_embd)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))  # (T, n_embd)
+        x = tok_emb + pos_emb  # (B, T, n_embd)
+
+        # 依次通过每个 Block（就像流水线上的工序）
+        for block in self.blocks:
+            x = block(x)
+
+        # 最终归一化 + 输出层
+        x = self.ln_final(x)           # (B, T, n_embd)
+        logits = self.lm_head(x)       # (B, T, vocab_size)
+
+        loss = None
+        if targets is not None:
+            B, T, C = logits.shape
+            logits_flat = logits.view(B * T, C)
+            targets_flat = targets.view(B * T)
+            loss = F.cross_entropy(logits_flat, targets_flat)
+
+        return logits, loss
+
+
+# ======================== Block 工厂函数 ========================
+
+def build_blocks(block_names: list[str], n_embd: int, n_head: int,
+                 block_size: int) -> list[nn.Module]:
+    """
+    根据名称列表创建 Block 实例 —— 积木的"组装说明书"。
+
+    这个函数是连接"配置"和"实际模型"的桥梁：
+      - train.py 用它根据配置创建模型
+      - generate.py 用它根据 checkpoint 里保存的配置重建模型
+
+    参数：
+        block_names: Block 名称列表，如 ["attention", "ffn"]
+        n_embd:     向量维度
+        n_head:     注意力头数
+        block_size: 最大上下文长度
+
+    返回：
+        Block 实例列表
+    """
+    blocks = []
+    for name in block_names:
+        if name == "attention":
+            blocks.append(AttentionBlock(n_embd, n_head, block_size))
+        elif name == "ffn":
+            blocks.append(FFNBlock(n_embd))
+        else:
+            raise ValueError(f"未知的 Block 类型: {name}")
+    return blocks
+
+
 # ======================== Self-Attention 语言模型 ========================
 
 class SelfAttentionLanguageModel(BaseLanguageModel):
@@ -377,4 +667,8 @@ class SelfAttentionLanguageModel(BaseLanguageModel):
 MODEL_REGISTRY = {
     "bigram": BigramLanguageModel,
     "attention": SelfAttentionLanguageModel,
+    # 以下模型通过 AssembledModel + Block 列表组装，在 train.py 中配置
+    "attention_ffn": AssembledModel,
+    "multihead": AssembledModel,
+    "multihead_ffn": AssembledModel,
 }

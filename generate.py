@@ -13,7 +13,7 @@
 import argparse
 import os
 import torch
-from model import MODEL_REGISTRY
+from model import MODEL_REGISTRY, build_blocks
 
 
 def main():
@@ -53,6 +53,12 @@ def main():
     config = checkpoint.get("config", {"vocab_size": vocab_size})
 
     ModelClass = MODEL_REGISTRY[model_type]
+    if "block_names" in config:
+        # 组装式模型：需要先根据配置创建 Block 列表
+        block_names = config.pop("block_names")
+        n_head = config.pop("n_head")
+        blocks = build_blocks(block_names, config["n_embd"], n_head, config["block_size"])
+        config["blocks"] = blocks
     model = ModelClass(**config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()  # 切到"使用模式"（关闭训练专用功能）
