@@ -1,6 +1,6 @@
 # Architecture
 
-The project implements multiple character-level language models with a shared interface. Each unique character in the training data maps to an integer index. There are no subword tokenizers.
+The project implements multiple character-level language models with a shared interface and a pluggable architecture. Each unique character in the training data maps to an integer index via a `CharTokenizer`. Tokenizers, embeddings, and processing blocks are all designed as independent, composable plugins.
 
 ## Model Hierarchy
 
@@ -29,11 +29,18 @@ Block 组装示例：
 
 ## Components
 
+- **tokenizer.py** — Tokenizer plugins:
+  - `CharTokenizer`: Character-level tokenizer (one char = one token). Supports `encode`/`decode`/`to_dict`/`from_dict`.
+  - `load_tokenizer()`: Restores a tokenizer from checkpoint data.
+  - `TOKENIZER_REGISTRY`: Dict mapping tokenizer type names to classes.
 - **model.py** — All model classes and组件:
   - `BaseLanguageModel`: Abstract base with shared `generate()` method
   - `BigramLanguageModel`: A single `nn.Embedding(vocab_size, vocab_size)` table. Each token looks up a row of logits for the next token.
   - `Head`: Single self-attention head with Q/K/V projections and causal mask.
   - `SelfAttentionLanguageModel`: Token embedding + position embedding → self-attention → linear output. Uses `n_embd=64` dimensional embeddings and `block_size=256` context window.
+  - `TokenEmbedding`: Pure token embedding (token index → vector). No position information.
+  - `TokenPositionEmbedding`: Token + position embedding (token index → vector with position).
+  - `build_embedding()`: Factory function that creates Embedding plugins from type name.
   - `FeedForward`: Two-layer MLP (expand 4x → ReLU → compress back). Independent of attention.
   - `MultiHeadAttention`: Multiple `Head` instances in parallel + projection layer.
   - `AttentionBlock`: Plug-in block wrapping LayerNorm + attention (single/multi-head) + residual connection.

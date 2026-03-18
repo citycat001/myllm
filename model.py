@@ -8,6 +8,8 @@
   - AssembledModel: 积木式模型，通过 Block 列表自由组装
 
 组件（可独立使用的积木块）：
+  - TokenEmbedding: 纯 token 嵌入（字 → 向量）
+  - TokenPositionEmbedding: token + 位置嵌入（字 + 位置 → 向量）
   - Head: 单个自注意力头
   - FeedForward: 前馈网络（两层 MLP）
   - MultiHeadAttention: 多头注意力（多个 Head 并行）
@@ -170,6 +172,66 @@ class BigramLanguageModel(BaseLanguageModel):
             loss = F.cross_entropy(logits_flat, targets_flat)
 
         return logits, loss
+
+
+# ======================== Embedding 插件 ========================
+
+class TokenEmbedding(nn.Module):
+    """
+    纯 Token 嵌入 —— 最简单的嵌入方式，只把字变成向量。
+
+    这是 Bigram 模型使用的嵌入方式：每个字查表得到一个向量，不包含位置信息。
+    适用于不需要位置感知的模型（比如 Bigram 只看前一个字，位置无所谓）。
+
+    输入：字的编号 (B, T) → 输出：向量序列 (B, T, n_embd)
+    """
+
+    def __init__(self, vocab_size: int, n_embd: int):
+        """
+        参数：
+            vocab_size: 词表大小（有多少个不同的字）
+            n_embd:     嵌入维度（每个字用多少个数字表示）
+        """
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        return self.token_embedding_table(idx)  # (B, T, n_embd)
+
+
+class TokenPositionEmbedding(nn.Module):
+    """
+    Token + Position 嵌入 —— 同时编码"是什么字"和"在第几个位置"。
+
+    在 Token Embedding 的基础上加入了位置编码。
+    注意力模型必须用这种嵌入，因为注意力机制本身不知道字的顺序——
+    "曹操引兵"和"兵引操曹"在纯注意力看来是一样的。
+    位置编码让每个位置有独特的向量，模型就能区分顺序了。
+
+    做法：token 向量 + position 向量（逐元素相加）。
+    为什么用加法而不是拼接？因为加法更简单高效，实验表明效果一样好。
+
+    输入：字的编号 (B, T) → 输出：融合了字义和位置的向量序列 (B, T, n_embd)
+    """
+
+    def __init__(self, vocab_size: int, n_embd: int, block_size: int):
+        """
+        参数：
+            vocab_size: 词表大小
+            n_embd:     嵌入维度
+            block_size: 最大上下文长度（位置编码表的行数）
+        """
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)  # (B, T, n_embd)
+        pos_emb = self.position_embedding_table(
+            torch.arange(T, device=idx.device)
+        )  # (T, n_embd)，自动广播到 (B, T, n_embd)
+        return tok_emb + pos_emb  # (B, T, n_embd)
 
 
 # ======================== 自注意力头 ========================
@@ -448,45 +510,45 @@ class FFNBlock(nn.Module):
 
 class AssembledModel(BaseLanguageModel):
     """
-    积木式语言模型 —— 通过 Block 列表自由组装的模型。
+    积木式语言模型 —— 通过插件自由组装的模型。
 
-    这个模型本身不包含任何注意力或 FFN 的实现，
-    它只负责"搭台子"（embedding + 位置编码 + 输出层），
-    中间的"表演"全部交给传入的 Block 列表。
+    这个模型本身不包含任何具体的 Embedding、注意力或 FFN 实现，
+    所有组件都通过参数传入，像积木一样组装：
+      - embedding：嵌入插件（把字变成向量）
+      - blocks：处理插件列表（注意力、FFN 等，按顺序串联）
 
     就像一个舞台：
-      - 舞台本身（AssembledModel）提供灯光、音响等基础设施
-      - 节目内容（blocks）可以自由编排 —— 先来一段注意力，再来一段 FFN，或者任意组合
+      - 舞台本身（AssembledModel）只提供框架（输出层）
+      - 入场方式（embedding）和节目内容（blocks）都可以自由更换
 
     用法示例：
-      # 单头注意力 + FFN
-      blocks = [AttentionBlock(64, 1, 256), FFNBlock(64)]
-      model = AssembledModel(vocab_size, 64, 256, blocks)
-
-      # 多头注意力（无 FFN）
-      blocks = [AttentionBlock(64, 4, 256)]
-      model = AssembledModel(vocab_size, 64, 256, blocks)
-
-      # 多头注意力 + FFN（标准 Transformer Block）
+      # Token+Position 嵌入 + 多头注意力 + FFN
+      embedding = TokenPositionEmbedding(vocab_size, 64, 256)
       blocks = [AttentionBlock(64, 4, 256), FFNBlock(64)]
-      model = AssembledModel(vocab_size, 64, 256, blocks)
+      model = AssembledModel(vocab_size, 64, 256, embedding, blocks)
+
+      # 纯 Token 嵌入 + 单头注意力（类似 Bigram 的简单嵌入）
+      embedding = TokenEmbedding(vocab_size, 64)
+      blocks = [AttentionBlock(64, 1, 256)]
+      model = AssembledModel(vocab_size, 64, 256, embedding, blocks)
     """
 
     def __init__(self, vocab_size: int, n_embd: int, block_size: int,
-                 blocks: list[nn.Module]):
+                 embedding: nn.Module, blocks: list[nn.Module]):
         """
         参数：
             vocab_size: 词表大小
             n_embd:     嵌入维度
             block_size: 最大上下文长度
+            embedding:  嵌入插件，负责把 (B, T) 的字编号变成 (B, T, n_embd) 的向量
             blocks:     Block 列表，按顺序串联执行
         """
         super().__init__()
         self.block_size = block_size
 
-        # 和 SelfAttentionLanguageModel 一样的 embedding 层
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        # 嵌入插件：把字的编号变成向量
+        # 可以是 TokenEmbedding（纯字向量）或 TokenPositionEmbedding（字+位置）
+        self.embedding = embedding
 
         # 把传入的 Block 列表注册为子模块
         # nn.ModuleList 确保 PyTorch 能正确管理这些 Block 的参数
@@ -503,14 +565,12 @@ class AssembledModel(BaseLanguageModel):
         前向传播：embedding → blocks → 输出打分。
 
         数据流动过程：
-          字 → token embedding + position embedding → block1 → block2 → ... → LayerNorm → 输出打分
+          字 → embedding 插件 → block1 → block2 → ... → LayerNorm → 输出打分
         """
         B, T = idx.shape
 
-        # 字向量 + 位置向量（和 SelfAttentionLanguageModel 一样）
-        tok_emb = self.token_embedding_table(idx)                              # (B, T, n_embd)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))  # (T, n_embd)
-        x = tok_emb + pos_emb  # (B, T, n_embd)
+        # 嵌入：把字的编号变成向量（具体做法由传入的 embedding 插件决定）
+        x = self.embedding(idx)  # (B, T, n_embd)
 
         # 依次通过每个 Block（就像流水线上的工序）
         for block in self.blocks:
@@ -530,7 +590,29 @@ class AssembledModel(BaseLanguageModel):
         return logits, loss
 
 
-# ======================== Block 工厂函数 ========================
+# ======================== 插件工厂函数 ========================
+
+def build_embedding(embedding_type: str, vocab_size: int, n_embd: int,
+                    block_size: int) -> nn.Module:
+    """
+    根据类型名称创建 Embedding 插件 —— 嵌入层的"选配单"。
+
+    参数：
+        embedding_type: 嵌入类型，"token" 或 "token_position"
+        vocab_size:     词表大小
+        n_embd:         嵌入维度
+        block_size:     最大上下文长度（仅 token_position 需要）
+
+    返回：
+        Embedding 插件实例
+    """
+    if embedding_type == "token":
+        return TokenEmbedding(vocab_size, n_embd)
+    elif embedding_type == "token_position":
+        return TokenPositionEmbedding(vocab_size, n_embd, block_size)
+    else:
+        raise ValueError(f"未知的 Embedding 类型: {embedding_type}")
+
 
 def build_blocks(block_names: list[str], n_embd: int, n_head: int,
                  block_size: int) -> list[nn.Module]:

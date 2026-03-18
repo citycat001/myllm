@@ -15,7 +15,7 @@
 | 第 5 步 | BPE 分词器 | 待做 |
 | 第 6 步 | 自定义数据微调 | 待做 |
 
-**本篇新增的核心概念：Multi-Head Attention（多头注意力）、Feed-Forward Network（前馈网络）、残差连接（Residual Connection）、层归一化（Layer Normalization）、Block 组装架构**
+**本篇新增的核心概念：Multi-Head Attention（多头注意力）、Feed-Forward Network（前馈网络）、残差连接（Residual Connection）、层归一化（Layer Normalization）、Block 组装架构、Tokenizer 插件、Embedding 插件**
 
 ---
 
@@ -372,6 +372,68 @@ uv run python generate.py --model multihead_ffn_model.pt --prompt "却说曹操"
 
 ---
 
+## 顺手把分词器和嵌入层也做成插件
+
+既然注意力和 FFN 都做成了可插拔的积木，分词器（Tokenizer）和嵌入层（Embedding）也不应该"焊死"在代码里。
+
+### 分词器插件（CharTokenizer）
+
+之前分词逻辑是直接写在 `train.py` 里的几行代码。现在我们把它抽成了 `CharTokenizer` 类：
+
+```python
+# 之前：散落在 train.py 里
+chars = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(chars)}
+encode = lambda s: [stoi[c] for c in s]
+
+# 现在：一个干净的类
+tokenizer = CharTokenizer.from_text(text)
+encoded = tokenizer.encode("曹操")     # → [1038, 2893]
+decoded = tokenizer.decode([1038, 2893]) # → "曹操"
+```
+
+好处：
+- 第 5 步做 BPE 分词器时，只需新增一个 `BPETokenizer` 类，实现同样的 `encode`/`decode` 接口
+- `train.py` 和 `generate.py` 的调用代码完全不用改
+- 分词器的序列化（`to_dict`/`from_dict`）让 checkpoint 保存更规范
+
+### 嵌入层插件（TokenEmbedding / TokenPositionEmbedding）
+
+同样，嵌入层也不再硬编码在模型里，而是作为插件传给 `AssembledModel`：
+
+```python
+# TokenEmbedding：纯字向量（不含位置信息）
+embedding = TokenEmbedding(vocab_size, n_embd)
+
+# TokenPositionEmbedding：字向量 + 位置向量
+embedding = TokenPositionEmbedding(vocab_size, n_embd, block_size)
+
+# 传给组装台
+model = AssembledModel(vocab_size, n_embd, block_size, embedding, blocks)
+```
+
+工厂函数 `build_embedding()` 根据配置名称自动创建对应的嵌入插件，和 `build_blocks()` 的模式一致。
+
+### 完整的插件架构一览
+
+```
+AssembledModel（组装台）
+├── embedding（嵌入插件）
+│   ├── TokenEmbedding           ← 纯字向量
+│   └── TokenPositionEmbedding   ← 字 + 位置向量
+├── blocks（处理插件列表）
+│   ├── AttentionBlock           ← 注意力积木
+│   └── FFNBlock                 ← 前馈网络积木
+└── lm_head（输出层）
+
+CharTokenizer（分词插件，在模型外部）
+└── encode/decode               ← 文字 ↔ 数字
+```
+
+从数据输入（分词）到向量化（嵌入）到特征提取（注意力 + FFN），整条 pipeline 都是可配置的。
+
+---
+
 ## 总结
 
 | 你学到了什么 | 一句话回顾 |
@@ -383,6 +445,8 @@ uv run python generate.py --model multihead_ffn_model.pt --prompt "却说曹操"
 | **AttentionBlock / FFNBlock** | 统一接口的积木块，可自由组装 |
 | **AssembledModel** | 积木组装台，通过 Block 列表定义模型结构 |
 | **build_blocks** | 工厂函数，根据配置名称创建积木列表 |
+| **CharTokenizer** | 分词器插件，把文字变成数字（后续可替换为 BPE） |
+| **TokenPositionEmbedding** | 嵌入插件，把字编号和位置变成向量 |
 
 从单头到多头，从固定结构到积木组装，模型的灵活性和表达能力都上了一个台阶。注意力负责"收集信息"，FFN 负责"消化信息"，残差和 LayerNorm 负责"稳定后勤"——这三者的组合就是 Transformer 的核心骨架。
 
