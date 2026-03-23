@@ -13,6 +13,9 @@ uv run python train.py --model-type attention
 uv run python train.py --model-type attention_ffn   # 单头注意力 + FFN
 uv run python train.py --model-type multihead       # 4头注意力（无 FFN）
 uv run python train.py --model-type multihead_ffn   # 4头注意力 + FFN
+
+# 训练 Mini-GPT（6层 Transformer 套装积木 + Dropout）
+uv run python train.py --model-type mini_gpt
 ```
 
 ## Text Generation
@@ -30,6 +33,10 @@ uv run python generate.py --model attention_model.pt --prompt "却说曹操" --l
 uv run python generate.py --model attention_ffn_model.pt
 uv run python generate.py --model multihead_model.pt
 uv run python generate.py --model multihead_ffn_model.pt --prompt "却说曹操" --length 200
+
+# 用 Mini-GPT 模型生成文本
+uv run python generate.py --model mini_gpt_model.pt
+uv run python generate.py --model mini_gpt_model.pt --prompt "却说曹操" --length 200
 ```
 
 ## Package Management

@@ -10,17 +10,22 @@ BaseLanguageModel (nn.Module)        ← 共享接口：forward() + generate()
 ├── SelfAttentionLanguageModel       ← 能看前 block_size 个字，含自注意力机制
 │   └── Head                         ← 单头自注意力（Q/K/V + 因果遮罩）
 └── AssembledModel                   ← 积木式模型，通过 Block 列表自由组装
-    ├── AttentionBlock               ← 注意力插件（LayerNorm + 注意力 + 残差）
+    ├── AttentionBlock               ← 注意力散装插件（LayerNorm + 注意力 + 残差）
     │   └── MultiHeadAttention       ← 统一使用多头注意力（n_head=1 也走此路径）
     │       └── Head × n_head        ← 多个独立的注意力头
-    └── FFNBlock                     ← 前馈网络插件（LayerNorm + FFN + 残差）
-        └── FeedForward              ← 两层 MLP（展开→ReLU→压缩）
+    ├── FFNBlock                     ← 前馈网络散装插件（LayerNorm + FFN + 残差）
+    │   └── FeedForward              ← 两层 MLP（展开→ReLU→压缩）
+    └── TransformerBlock             ← Transformer 套装插件（注意力 + FFN + Dropout + 残差）
+        ├── MultiHeadAttention       ← 多头注意力（含 Dropout）
+        │   └── Head × n_head        ← 多个独立的注意力头（含注意力权重 Dropout）
+        └── FeedForward              ← 两层 MLP（含输出 Dropout）
 ```
 
 Block 组装示例：
-- `["attention"]` (n_head=4) → 纯多头注意力
-- `["attention", "ffn"]` (n_head=1) → 单头注意力 + FFN
-- `["attention", "ffn"]` (n_head=4) → 多头注意力 + FFN（标准 Transformer Block）
+- `["attention"]` (n_head=4) → 纯多头注意力（散装）
+- `["attention", "ffn"]` (n_head=1) → 单头注意力 + FFN（散装）
+- `["attention", "ffn"]` (n_head=4) → 多头注意力 + FFN（散装）
+- `["transformer"]` (n_head=6, n_layer=6, dropout=0.2) → Mini-GPT（6层套装 Transformer）
 
 ## Data Flow
 
@@ -44,8 +49,9 @@ Block 组装示例：
   - `MultiHeadAttention`: Multiple `Head` instances in parallel + projection layer.
   - `AttentionBlock`: Plug-in block wrapping LayerNorm + attention (single/multi-head) + residual connection.
   - `FFNBlock`: Plug-in block wrapping LayerNorm + FeedForward + residual connection.
+  - `TransformerBlock`: Integrated Transformer layer (attention + FFN + Dropout + residual). The "set equipment" upgrade.
   - `AssembledModel`: Takes a list of Block instances and chains them between embedding and output layers.
-  - `build_blocks()`: Factory function that creates Block instances from a list of names.
+  - `build_blocks()`: Factory function that creates Block instances from a list of names. Supports `n_layer` for multi-layer stacking and `dropout` for TransformerBlock.
   - `MODEL_REGISTRY`: Dict mapping model type names to classes.
 - **train.py** — Loads `data/input.txt`, builds char↔int vocab mappings (`stoi`/`itos`), splits 90/10 train/val, trains with AdamW, saves checkpoint. Supports `--model-type` to select between models.
 - **generate.py** — CLI that loads a checkpoint, auto-detects model type from saved `model_type` field, and generates text.

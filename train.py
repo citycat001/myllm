@@ -7,11 +7,13 @@
   - attention_ffn: 单头注意力 + 前馈网络
   - multihead:     多头注意力
   - multihead_ffn: 多头注意力 + 前馈网络
+  - mini_gpt:      Mini-GPT（6层 Transformer 套装积木 + Dropout）
 
 用法：
   uv run python train.py                              # 默认训练 bigram 模型
   uv run python train.py --model-type attention        # 训练 attention 模型
   uv run python train.py --model-type multihead_ffn    # 训练多头+FFN 模型
+  uv run python train.py --model-type mini_gpt         # 训练 Mini-GPT 模型
 
 训练流程（不管哪个模型都一样）：
   1. 读取《三国演义》全文
@@ -24,8 +26,10 @@
 
 import argparse
 import os
+
 import torch
-from model import MODEL_REGISTRY, build_embedding, build_blocks
+
+from model import MODEL_REGISTRY, build_blocks, build_embedding
 from tokenizer import CharTokenizer
 
 # ======================== 命令行参数 ========================
@@ -49,17 +53,17 @@ model_type = args.model_type
 
 MODEL_CONFIGS = {
     "bigram": {
-        "batch_size": 64,       # 每次训练同时看 64 条文本片段
-        "block_size": 8,        # 每条片段 8 个字（Bigram 只看前 1 个字，这个值不太重要）
-        "max_steps": 10000,     # 总共训练 10000 轮
-        "lr": 1e-2,             # 学习率 0.01（简单模型可以用大步子走）
+        "batch_size": 64,  # 每次训练同时看 64 条文本片段
+        "block_size": 8,  # 每条片段 8 个字（Bigram 只看前 1 个字，这个值不太重要）
+        "max_steps": 10000,  # 总共训练 10000 轮
+        "lr": 1e-2,  # 学习率 0.01（简单模型可以用大步子走）
     },
     "attention": {
-        "batch_size": 32,       # 模型更大，一批不能太多，不然内存不够
-        "block_size": 256,      # 注意力模型能利用更长的上下文
+        "batch_size": 32,  # 模型更大，一批不能太多，不然内存不够
+        "block_size": 256,  # 注意力模型能利用更长的上下文
         "max_steps": 10000,
-        "lr": 1e-3,             # 复杂模型需要更小的步子，不然容易"走偏"
-        "n_embd": 64,           # 每个字用 64 维的向量表示
+        "lr": 1e-3,  # 复杂模型需要更小的步子，不然容易"走偏"
+        "n_embd": 64,  # 每个字用 64 维的向量表示
     },
     "attention_ffn": {
         "batch_size": 32,
@@ -67,9 +71,9 @@ MODEL_CONFIGS = {
         "max_steps": 10000,
         "lr": 1e-3,
         "n_embd": 64,
-        "n_head": 1,                                # 单头注意力
-        "embedding_type": "token_position",          # 嵌入插件：字 + 位置
-        "block_names": ["attention", "ffn"],         # 积木组合：注意力 + 前馈网络
+        "n_head": 1,  # 单头注意力
+        "embedding_type": "token_position",  # 嵌入插件：字 + 位置
+        "block_names": ["attention", "ffn"],  # 积木组合：注意力 + 前馈网络
     },
     "multihead": {
         "batch_size": 32,
@@ -77,9 +81,9 @@ MODEL_CONFIGS = {
         "max_steps": 10000,
         "lr": 1e-3,
         "n_embd": 64,
-        "n_head": 4,                                # 4 头注意力
-        "embedding_type": "token_position",          # 嵌入插件：字 + 位置
-        "block_names": ["attention"],                # 积木组合：仅多头注意力
+        "n_head": 4,  # 4 头注意力
+        "embedding_type": "token_position",  # 嵌入插件：字 + 位置
+        "block_names": ["attention"],  # 积木组合：仅多头注意力
     },
     "multihead_ffn": {
         "batch_size": 32,
@@ -87,9 +91,21 @@ MODEL_CONFIGS = {
         "max_steps": 10000,
         "lr": 1e-3,
         "n_embd": 64,
-        "n_head": 4,                                # 4 头注意力
-        "embedding_type": "token_position",          # 嵌入插件：字 + 位置
-        "block_names": ["attention", "ffn"],         # 积木组合：多头注意力 + 前馈网络
+        "n_head": 4,  # 4 头注意力
+        "embedding_type": "token_position",  # 嵌入插件：字 + 位置
+        "block_names": ["attention", "ffn"],  # 积木组合：多头注意力 + 前馈网络
+    },
+    "mini_gpt": {
+        "batch_size": 64,
+        "block_size": 256,
+        "max_steps": 5000,
+        "lr": 3e-4,  # 更大的模型需要更小的学习率
+        "n_embd": 384,  # 嵌入维度（384 / 6 头 = 每头 64 维）
+        "n_head": 6,  # 6 头注意力
+        "n_layer": 6,  # 6 层 Transformer（堆叠 6 个 TransformerBlock）
+        "dropout": 0.2,  # 随机丢弃 20% 的连接，防止过拟合
+        "embedding_type": "token_position",
+        "block_names": ["transformer"],  # 套装积木：注意力 + FFN + Dropout 一体化
     },
 }
 
@@ -100,15 +116,19 @@ MAX_STEPS = cfg["max_steps"]
 LEARNING_RATE = cfg["lr"]
 N_EMBD = cfg.get("n_embd")
 N_HEAD = cfg.get("n_head")
+N_LAYER = cfg.get("n_layer", 1)
+DROPOUT = cfg.get("dropout", 0.0)
 
 # 通用超参数
 EVAL_INTERVAL = 1000  # 每 1000 轮看一次成绩
-EVAL_ITERS = 200      # 看成绩时用 200 组题算平均分
+EVAL_ITERS = 200  # 看成绩时用 200 组题算平均分
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"Model type: {model_type}")
-print(f"Hyperparameters: batch_size={BATCH_SIZE}, block_size={BLOCK_SIZE}, "
-      f"max_steps={MAX_STEPS}, lr={LEARNING_RATE}")
+print(
+    f"Hyperparameters: batch_size={BATCH_SIZE}, block_size={BLOCK_SIZE}, "
+    f"max_steps={MAX_STEPS}, lr={LEARNING_RATE}"
+)
 
 
 # ======================== 加载数据 ========================
@@ -220,9 +240,16 @@ elif model_type == "attention":
 else:
     # 组装式模型：根据配置动态创建嵌入插件和 Block 列表
     embedding = build_embedding(cfg["embedding_type"], vocab_size, N_EMBD, BLOCK_SIZE)
-    blocks = build_blocks(cfg["block_names"], N_EMBD, N_HEAD, BLOCK_SIZE)
-    model = ModelClass(vocab_size, n_embd=N_EMBD, block_size=BLOCK_SIZE,
-                       embedding=embedding, blocks=blocks).to(DEVICE)
+    blocks = build_blocks(
+        cfg["block_names"], N_EMBD, N_HEAD, BLOCK_SIZE, n_layer=N_LAYER, dropout=DROPOUT
+    )
+    model = ModelClass(
+        vocab_size,
+        n_embd=N_EMBD,
+        block_size=BLOCK_SIZE,
+        embedding=embedding,
+        blocks=blocks,
+    ).to(DEVICE)
 
 param_count = sum(p.numel() for p in model.parameters())
 print(f"Model parameters: {param_count:,}")
@@ -249,11 +276,12 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 #   4. 按照梯度的方向微调参数
 print("Training...")
 for step in range(MAX_STEPS):
-
     # 每隔 EVAL_INTERVAL 轮看一次训练成绩和考试成绩
     if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
         losses = estimate_loss(model)
-        print(f"  step {step:5d} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
+        print(
+            f"  step {step:5d} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}"
+        )
 
     # 第 1 步：随机抽一批练习题
     xb, yb = get_batch("train")
@@ -294,20 +322,25 @@ if "block_names" in cfg:
     # 组装式模型：保存嵌入类型、积木组合和头数，加载时重建
     config["embedding_type"] = cfg["embedding_type"]
     config["n_head"] = N_HEAD
+    config["n_layer"] = N_LAYER
+    config["dropout"] = DROPOUT
     config["block_names"] = cfg["block_names"]
 
 save_filename = f"{model_type}_model.pt"
 save_path = os.path.join(os.path.dirname(__file__), save_filename)
-torch.save({
-    "model_state_dict": model.state_dict(),
-    "model_type": model_type,
-    "config": config,
-    "vocab_size": vocab_size,
-    "tokenizer": tokenizer.to_dict(),
-    # 兼容旧版本：同时保存 stoi/itos，这样旧的 generate.py 也能加载
-    "stoi": tokenizer.stoi,
-    "itos": tokenizer.itos,
-}, save_path)
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "model_type": model_type,
+        "config": config,
+        "vocab_size": vocab_size,
+        "tokenizer": tokenizer.to_dict(),
+        # 兼容旧版本：同时保存 stoi/itos，这样旧的 generate.py 也能加载
+        "stoi": tokenizer.stoi,
+        "itos": tokenizer.itos,
+    },
+    save_path,
+)
 print(f"Model saved to {save_path}")
 
 
