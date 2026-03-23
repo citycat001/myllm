@@ -392,43 +392,34 @@ x = x + ffn(LayerNorm(x))         # 同样的模式
 - 有些实验：只用注意力不加 FFN
 - 有些实验：用单头注意力 + FFN
 
-我们把每个组件包装成统一接口的 Block：输入 `(B, T, n_embd)` → 输出 `(B, T, n_embd)`。只要接口一致，就能像乐高积木一样自由拼装。
+我们的设计理念是：**积木定义固定的操作流程（LayerNorm → 算法 → 残差），算法组件可以自由替换。** 就像游戏里的武器框架——同一个框架，装上不同的核心模块，就变成不同的武器。
 
-### AttentionBlock：注意力积木
-
-```python
-class AttentionBlock(nn.Module):
-    """注意力插件 —— LayerNorm + 注意力 + 残差连接。"""
-
-    def __init__(self, n_embd, n_head, block_size):
-        super().__init__()
-        self.ln = nn.LayerNorm(n_embd)
-        # 统一使用 MultiHeadAttention，n_head=1 就是"只有一个头的多头注意力"
-        head_size = n_embd // n_head
-        self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)
-
-    def forward(self, x):
-        return x + self.attn(self.ln(x))   # 残差 + LayerNorm + 注意力
-```
-
-不管 `n_head=1` 还是 `n_head=4`，都走同一条路径（MultiHeadAttention），对外接口完全一样。这样单头和多头的结构完全对称（都有投影层），对比实验更公平。
-
-### FFNBlock：前馈网络积木
+### Block：通用积木
 
 ```python
-class FFNBlock(nn.Module):
-    """前馈网络插件 —— LayerNorm + FFN + 残差连接。"""
+class Block(nn.Module):
+    """通用积木 —— 固定流程 + 可插拔算法组件。"""
 
-    def __init__(self, n_embd):
+    def __init__(self, n_embd, op):
         super().__init__()
         self.ln = nn.LayerNorm(n_embd)
-        self.ffn = FeedForward(n_embd)
+        self.op = op  # 可插拔的算法组件
 
     def forward(self, x):
-        return x + self.ffn(self.ln(x))    # 残差 + LayerNorm + FFN
+        return x + self.op(self.ln(x))  # LayerNorm → 算法 → 残差
 ```
 
-FFN 积木完全独立于注意力——它不关心输入是来自单头还是多头，甚至可以单独使用。
+`op` 可以是任何输入输出都是 `(B, T, n_embd)` 的模块。换不同的 `op`，积木的功能就完全不同：
+
+```python
+# 注意力积木：装上 MultiHeadAttention
+Block(n_embd=64, op=MultiHeadAttention(64, 4, 16, 256))
+
+# 前馈网络积木：装上 FeedForward
+Block(n_embd=64, op=FeedForward(64))
+```
+
+不管 `op` 是注意力还是 FFN，积木对外的接口完全一样：输入 `(B, T, n_embd)` → 输出 `(B, T, n_embd)`。这样它们就能像乐高一样自由拼装。
 
 ### AssembledModel：积木组装台
 
@@ -466,32 +457,46 @@ class AssembledModel(BaseLanguageModel):
 
 ```python
 # 配置 1：单头注意力 + FFN
-blocks = [AttentionBlock(64, n_head=1, block_size=256), FFNBlock(64)]
+blocks = [
+    Block(64, op=MultiHeadAttention(64, 1, 64, 256)),  # 注意力积木
+    Block(64, op=FeedForward(64)),                       # FFN 积木
+]
 
 # 配置 2：4头注意力（无 FFN）
-blocks = [AttentionBlock(64, n_head=4, block_size=256)]
+blocks = [Block(64, op=MultiHeadAttention(64, 4, 16, 256))]
 
 # 配置 3：4头注意力 + FFN（标准 Transformer Block）
-blocks = [AttentionBlock(64, n_head=4, block_size=256), FFNBlock(64)]
+blocks = [
+    Block(64, op=MultiHeadAttention(64, 4, 16, 256)),
+    Block(64, op=FeedForward(64)),
+]
 ```
 
-只要改变 Block 列表，就能得到完全不同的模型！
+只要改变 Block 列表里的算法组件，就能得到功能完全不同的模型！
 
-**注意**：本篇的配置都只用了 **1 层** Block（一个 AttentionBlock + 一个 FFNBlock）。真正的 Transformer 是把这对组合**堆叠 N 层**。下一篇（Mini-GPT）我们会把积木"叠高"，你会看到多层堆叠带来的显著提升。
+**注意**：本篇的配置都只用了 **1 层**（一个注意力积木 + 一个 FFN 积木）。真正的 Transformer 是把这对组合**堆叠 N 层**。下一篇（Mini-GPT）我们会把积木"叠高"，你会看到多层堆叠带来的显著提升。
 
-### build_blocks：积木的组装说明书
+### build_op + build_blocks：算法工厂 + 组装说明书
 
-为了让 `train.py` 和 `generate.py` 都能方便地创建 Block 列表，我们提供了一个工厂函数：
+手动创建算法组件太繁琐，我们提供两个工厂函数。`build_op` 根据名称创建算法组件，`build_blocks` 用它来组装积木列表：
 
 ```python
-def build_blocks(block_names, n_embd, n_head, block_size):
-    """根据名称列表创建 Block 实例。"""
+def build_op(name, n_embd, n_head, block_size, dropout=0.0):
+    """算法组件工厂：根据名称创建可插拔的算法。"""
+    if name == "attention":
+        head_size = n_embd // n_head
+        return MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
+    elif name == "ffn":
+        return FeedForward(n_embd, dropout)
+
+def build_blocks(block_names, n_embd, n_head, block_size,
+                 n_layer=1, dropout=0.0):
+    """积木组装说明书：根据配置创建 Block 列表。"""
     blocks = []
-    for name in block_names:
-        if name == "attention":
-            blocks.append(AttentionBlock(n_embd, n_head, block_size))
-        elif name == "ffn":
-            blocks.append(FFNBlock(n_embd))
+    for _ in range(n_layer):
+        for name in block_names:
+            op = build_op(name, n_embd, n_head, block_size, dropout)
+            blocks.append(Block(n_embd, op))
     return blocks
 ```
 
@@ -528,7 +533,7 @@ MODEL_CONFIGS = {
 → Token Embedding + Position Embedding         # 字义 + 位置 → 64维向量
   [1038] → [0.12, -0.5, ..., 0.3] (64维)
 
-→ AttentionBlock                               # 积木1：多头注意力
+→ Block(op=MultiHeadAttention)                  # 积木1：注意力
   ├── LayerNorm：归一化输入
   ├── 4个头并行做注意力：
   │   头1 关注 [曹→操] 语法关系
@@ -538,7 +543,7 @@ MODEL_CONFIGS = {
   ├── 拼接 + 投影：合并4个头的结论
   └── 残差连接：叠加原始输入
 
-→ FFNBlock                                     # 积木2：前馈网络
+→ Block(op=FeedForward)                         # 积木2：前馈网络
   ├── LayerNorm：归一化
   ├── 展开 64→256 → ReLU → 压缩 256→64
   └── 残差连接：叠加输入
@@ -632,8 +637,8 @@ AssembledModel（组装台）
 │   ├── TokenEmbedding           ← 纯字向量
 │   └── TokenPositionEmbedding   ← 字 + 位置向量
 ├── blocks（处理插件列表）
-│   ├── AttentionBlock           ← 注意力积木
-│   └── FFNBlock                 ← 前馈网络积木
+│   ├── Block(op=MultiHeadAttention)  ← 注意力积木
+│   └── Block(op=FeedForward)         ← 前馈网络积木
 └── lm_head（输出层）
 
 CharTokenizer（分词插件，在模型外部）
@@ -652,9 +657,9 @@ CharTokenizer（分词插件，在模型外部）
 | **FeedForward** | 两层 MLP（展开→ReLU→压缩），对每个字独立做非线性变换 |
 | **残差连接** | `x + f(x)` —— 保留原始信息，解决梯度消失 |
 | **LayerNorm** | 归一化数值范围，稳定训练 |
-| **AttentionBlock / FFNBlock** | 统一接口的积木块，可自由组装 |
+| **Block（通用积木）** | 固定流程（LN → op → 残差）+ 可插拔算法组件 |
 | **AssembledModel** | 积木组装台，通过 Block 列表定义模型结构 |
-| **build_blocks** | 工厂函数，根据配置名称创建积木列表 |
+| **build_op + build_blocks** | 算法工厂 + 组装说明书，根据配置创建积木列表 |
 | **CharTokenizer** | 分词器插件，把文字变成数字（后续可替换为 BPE） |
 | **TokenPositionEmbedding** | 嵌入插件，把字编号和位置变成向量 |
 
