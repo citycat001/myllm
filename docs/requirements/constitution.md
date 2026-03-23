@@ -1,7 +1,7 @@
 <!--
 Sync Impact Report
 ===================
-Version change: 1.0.0 -> 1.1.0 (MINOR — 3 new principles added)
+Version change: 1.1.0 -> 1.1.1 (PATCH — P5 wording clarified)
 Added principles: P8 Single Skin First, P9 Sub-60s Training, P10 Era = Complexity Tier
 Modified sections: Mission Statement (refined Game path description)
 Removed sections: None
@@ -11,7 +11,7 @@ Follow-up TODOs: None
 
 # Project Constitution: myllm
 
-**Version**: 1.1.0
+**Version**: 1.1.1
 **Ratification Date**: 2026-03-23
 **Last Amended**: 2026-03-23
 
@@ -79,10 +79,12 @@ learning from scratch.
 
 ### P5: Runnable Output
 
-Every assembly the user creates in the game MUST produce a valid,
-runnable Python training script — not just a diagram or visualization.
-The generated code MUST use the same composable components from the
-myllm codebase.
+Every assembly the user creates in the game MUST drive a real model
+training run using the myllm codebase — not just produce a diagram or
+visualization. The assembly produces a config that is consumed by the
+existing factory pattern (build_op, build_blocks, build_embedding) to
+construct and train a real PyTorch model. The user MUST be able to
+interact with the trained model (e.g., chat).
 
 **Rationale**: "I built this and it actually works" is the most powerful
 learning moment. The game isn't a simulation; it's a real model builder.
