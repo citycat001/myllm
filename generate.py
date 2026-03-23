@@ -13,20 +13,21 @@
 
 import argparse
 import os
+
 import torch
-from model import MODEL_REGISTRY, build_embedding, build_blocks
-from tokenizer import load_tokenizer, CharTokenizer
+
+from model import MODEL_REGISTRY, build_blocks, build_embedding
+from tokenizer import CharTokenizer, load_tokenizer
 
 
 def main():
     # ======================== 解析命令行参数 ========================
     parser = argparse.ArgumentParser(description="用训练好的模型生成文本")
-    parser.add_argument("--model", default="bigram_model.pt",
-                        help="模型文件路径（默认：bigram_model.pt）")
-    parser.add_argument("--prompt", default="",
-                        help="生成的开头文字（不填就从头开始写）")
-    parser.add_argument("--length", type=int, default=500,
-                        help="要生成多少个字（默认：500）")
+    parser.add_argument(
+        "--model", default="bigram_model.pt", help="模型文件路径（默认：bigram_model.pt）"
+    )
+    parser.add_argument("--prompt", default="", help="生成的开头文字（不填就从头开始写）")
+    parser.add_argument("--length", type=int, default=500, help="要生成多少个字（默认：500）")
     args = parser.parse_args()
 
     # ======================== 加载模型文件 ========================
@@ -64,12 +65,18 @@ def main():
             "n_embd": config["n_embd"],
             "block_size": config["block_size"],
             "embedding": build_embedding(
-                config["embedding_type"], config["vocab_size"],
-                config["n_embd"], config["block_size"]
+                config["embedding_type"],
+                config["vocab_size"],
+                config["n_embd"],
+                config["block_size"],
             ),
             "blocks": build_blocks(
-                config["block_names"], config["n_embd"],
-                config["n_head"], config["block_size"]
+                config["block_names"],
+                config["n_embd"],
+                config["n_head"],
+                config["block_size"],
+                n_layer=config.get("n_layer", 1),
+                dropout=config.get("dropout", 0.0),
             ),
         }
     else:

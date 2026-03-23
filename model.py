@@ -7,14 +7,17 @@
   - SelfAttentionLanguageModel: 加入自注意力机制，能看到更多上下文
   - AssembledModel: 积木式模型，通过 Block 列表自由组装
 
-组件（可独立使用的积木块）：
-  - TokenEmbedding: 纯 token 嵌入（字 → 向量）
-  - TokenPositionEmbedding: token + 位置嵌入（字 + 位置 → 向量）
+算法组件（可插拔的核心算法）：
   - Head: 单个自注意力头
   - FeedForward: 前馈网络（两层 MLP）
   - MultiHeadAttention: 多头注意力（多个 Head 并行）
-  - AttentionBlock: 注意力插件（LayerNorm + 注意力 + 残差连接）
-  - FFNBlock: 前馈网络插件（LayerNorm + FFN + 残差连接）
+
+积木与插件：
+  - TokenEmbedding: 纯 token 嵌入（字 → 向量）
+  - TokenPositionEmbedding: token + 位置嵌入（字 + 位置 → 向量）
+  - Block: 通用积木（固定流程：LayerNorm → 算法组件 → 残差连接）
+  - build_op(): 算法组件工厂，根据名称创建可插拔的算法
+  - build_blocks(): 积木组装说明书，根据配置创建 Block 列表
 
 所有模型共享同一套 forward() 和 generate() 接口，
 这样 train.py 和 generate.py 不需要关心具体是哪个模型 —— 换模型就像换引擎，底盘不用动。
@@ -24,8 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ======================== 基类 ========================
+
 
 class BaseLanguageModel(nn.Module):
     """
@@ -74,7 +77,7 @@ class BaseLanguageModel(nn.Module):
         for _ in range(max_new_tokens):
             # 截取最近的 block_size 个字作为输入
             # 好比人脑的"工作记忆"有限，只能同时关注最近的一段文字
-            idx_cond = idx[:, -self.block_size:]
+            idx_cond = idx[:, -self.block_size :]
 
             # 喂给模型，拿到预测
             logits, _ = self(idx_cond)
@@ -93,6 +96,7 @@ class BaseLanguageModel(nn.Module):
 
 
 # ======================== Bigram 模型 ========================
+
 
 class BigramLanguageModel(BaseLanguageModel):
     """
@@ -176,6 +180,7 @@ class BigramLanguageModel(BaseLanguageModel):
 
 # ======================== Embedding 插件 ========================
 
+
 class TokenEmbedding(nn.Module):
     """
     纯 Token 嵌入 —— 最简单的嵌入方式，只把字变成向量。
@@ -236,6 +241,7 @@ class TokenPositionEmbedding(nn.Module):
 
 # ======================== 自注意力头 ========================
 
+
 class Head(nn.Module):
     """
     单个自注意力头（Self-Attention Head）。
@@ -260,7 +266,9 @@ class Head(nn.Module):
       - 最终"兵"的表示融合了"曹操引"的上下文信息
     """
 
-    def __init__(self, n_embd: int, head_size: int, block_size: int):
+    def __init__(
+        self, n_embd: int, head_size: int, block_size: int, dropout: float = 0.0
+    ):
         """
         参数：
             n_embd:     输入向量的维度（每个字用多少个数字表示）。
@@ -270,6 +278,9 @@ class Head(nn.Module):
                         当前 head_size = n_embd = 64，所以输入输出维度一样大。
                         后面做多头注意力时，head_size 会变小（比如 4 个头，每头 64/4=16）。
             block_size: 最大上下文长度（决定因果遮罩的大小）
+            dropout:    Dropout 比例（0.0 = 不丢弃，0.2 = 随机丢弃 20%）。
+                        用在 softmax 之后：随机"忽略"一些字的注意力，防止过拟合。
+                        默认 0.0，向后兼容旧代码（散装积木不传此参数）。
         """
         super().__init__()
 
@@ -282,9 +293,18 @@ class Head(nn.Module):
         # 比喻：x 是完整简历，W_q/W_k/W_v 是三个不同的筛选器，
         #       分别从简历中挑出"你想问什么"、"你的标签"、"你的干货"。
         # 不用偏置（bias=False）是 Transformer 的惯例 —— 实验表明去掉偏置效果差不多，还能少点参数。
-        self.query = nn.Linear(n_embd, head_size, bias=False)  # W_q: (n_embd, head_size)
-        self.key = nn.Linear(n_embd, head_size, bias=False)    # W_k: (n_embd, head_size)
-        self.value = nn.Linear(n_embd, head_size, bias=False)  # W_v: (n_embd, head_size)
+        self.query = nn.Linear(
+            n_embd, head_size, bias=False
+        )  # W_q: (n_embd, head_size)
+        self.key = nn.Linear(n_embd, head_size, bias=False)  # W_k: (n_embd, head_size)
+        self.value = nn.Linear(
+            n_embd, head_size, bias=False
+        )  # W_v: (n_embd, head_size)
+
+        # 注意力权重的 Dropout：softmax 之后随机丢弃一些注意力连接。
+        # 好比开会时随机让一些人"暂时离席"，迫使模型不要过度依赖某几个字的信息。
+        # dropout=0.0 时等于没有 Dropout（nn.Dropout(0.0) 是恒等变换）。
+        self.attn_dropout = nn.Dropout(dropout)
 
         # 因果遮罩（Causal Mask）—— 一个下三角矩阵。
         # 作用：保证每个位置只能看到自己和前面的字，不能"偷看"后面的字。
@@ -314,7 +334,7 @@ class Head(nn.Module):
         #   v = x × W_v → "我的实际语义内容"（别的字来参考我时，拿到的就是这个）
         # 注意：x 已经融合了字义和位置信息（tok_emb + pos_emb），所以 Q/K/V 天然包含位置感知。
         q = self.query(x)  # (B, T, head_size) — 每个字的"提问"
-        k = self.key(x)    # (B, T, head_size) — 每个字的"标签牌"
+        k = self.key(x)  # (B, T, head_size) — 每个字的"标签牌"
         v = self.value(x)  # (B, T, head_size) — 每个字的"语义资料"
 
         # 第 2 步：计算注意力分数 —— Q 和 K 的点积
@@ -323,7 +343,7 @@ class Head(nn.Module):
         # 如果不除，当 head_size 很大时，点积值会非常大，
         # 经过 softmax 后会变成"一个接近 1，其余接近 0"的极端分布，
         # 梯度几乎为零，模型学不动。这个技巧叫"缩放点积注意力"。
-        wei = q @ k.transpose(-2, -1) * (C ** -0.5)  # (B, T, T)
+        wei = q @ k.transpose(-2, -1) * (C**-0.5)  # (B, T, T)
 
         # 第 3 步：应用因果遮罩
         # 把上三角的位置填成负无穷，这样经过 softmax 后这些位置的权重变成 0。
@@ -332,6 +352,8 @@ class Head(nn.Module):
 
         # 第 4 步：softmax 把分数转成概率（加起来等于 1）
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
+        # Dropout：随机丢弃一些注意力连接（仅训练时生效，eval 时自动关闭）
+        wei = self.attn_dropout(wei)
 
         # 第 5 步：用注意力权重对 V 做加权求和
         # 每个字的新表示 = 前面所有字的 V 的加权平均，权重就是注意力分数。
@@ -342,6 +364,7 @@ class Head(nn.Module):
 
 
 # ======================== 前馈网络 ========================
+
 
 class FeedForward(nn.Module):
     """
@@ -362,16 +385,19 @@ class FeedForward(nn.Module):
     然后把要点浓缩成简洁的结论。4 倍的展开比例是 Transformer 论文的经验值。
     """
 
-    def __init__(self, n_embd: int):
+    def __init__(self, n_embd: int, dropout: float = 0.0):
         """
         参数：
-            n_embd: 输入和输出的向量维度
+            n_embd:  输入和输出的向量维度
+            dropout: Dropout 比例，加在第二层线性变换之后。
+                     默认 0.0，向后兼容旧代码（散装积木不传此参数）。
         """
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),  # 展开：n_embd → 4 * n_embd
-            nn.ReLU(),                        # 非线性激活
-            nn.Linear(4 * n_embd, n_embd),   # 压缩：4 * n_embd → n_embd
+            nn.ReLU(),  # 非线性激活
+            nn.Linear(4 * n_embd, n_embd),  # 压缩：4 * n_embd → n_embd
+            nn.Dropout(dropout),  # 输出 Dropout：随机丢弃一些"思考结论"，防止过拟合
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -385,6 +411,7 @@ class FeedForward(nn.Module):
 
 
 # ======================== 多头注意力 ========================
+
 
 class MultiHeadAttention(nn.Module):
     """
@@ -404,24 +431,35 @@ class MultiHeadAttention(nn.Module):
     最后通过一个投影层把所有头的输出合并回 n_embd 维。
     """
 
-    def __init__(self, n_embd: int, n_head: int, head_size: int, block_size: int):
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        head_size: int,
+        block_size: int,
+        dropout: float = 0.0,
+    ):
         """
         参数：
             n_embd:     输入和输出的向量维度
             n_head:     注意力头的数量（同时开几场"会议"）
             head_size:  每个头的维度（= n_embd // n_head）
             block_size: 最大上下文长度
+            dropout:    Dropout 比例，传递给每个 Head 并用在投影后。
+                        默认 0.0，向后兼容旧代码。
         """
         super().__init__()
         # 创建 n_head 个独立的注意力头，每个头有自己的 Q/K/V 矩阵
         # 用 nn.ModuleList 而不是普通 list，这样 PyTorch 能正确管理这些头的参数
-        self.heads = nn.ModuleList([
-            Head(n_embd, head_size, block_size) for _ in range(n_head)
-        ])
+        self.heads = nn.ModuleList(
+            [Head(n_embd, head_size, block_size, dropout) for _ in range(n_head)]
+        )
         # 投影层：把 n_head 个头的输出拼接后，映射回 n_embd 维
         # 输入维度 = n_head * head_size = n_embd，输出维度 = n_embd
         # 这个投影层让模型学会"如何最好地合并各个头的结论"
         self.proj = nn.Linear(n_head * head_size, n_embd, bias=False)
+        # 投影后的 Dropout：合并各头结论后随机丢弃一些维度
+        self.proj_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -432,22 +470,37 @@ class MultiHeadAttention(nn.Module):
         """
         # 每个头独立处理输入，各自得到 (B, T, head_size) 的输出
         # 然后在最后一个维度上拼接：n_head 个 head_size 拼成 n_embd
-        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B, T, n_head * head_size)
-        # 通过投影层合并信息
-        out = self.proj(out)  # (B, T, n_embd)
+        out = torch.cat(
+            [h(x) for h in self.heads], dim=-1
+        )  # (B, T, n_head * head_size)
+        # 通过投影层合并信息，然后 Dropout
+        out = self.proj_dropout(self.proj(out))  # (B, T, n_embd)
         return out
 
 
-# ======================== 可组装的 Block 插件 ========================
+# ======================== 通用积木 ========================
 
-class AttentionBlock(nn.Module):
+
+class Block(nn.Module):
     """
-    注意力插件 —— 把注意力层包装成一个标准积木块。
+    通用积木 —— 固定流程 + 可插拔算法组件。
 
-    包含三个部分：
-      1. LayerNorm：归一化，让输入的数值稳定在合理范围（防止数值爆炸或消失）
-      2. 注意力层：单头或多头，根据 n_head 自动选择
-      3. 残差连接：把注意力的输出加上原始输入（x + attention(x)）
+    积木定义了一个固定的处理流程：
+      1. LayerNorm：归一化输入
+      2. 算法组件（op）：执行核心操作（注意力、前馈网络等）
+      3. 残差连接：把输出加上原始输入
+
+    流程是固定的（每个积木都走 LayerNorm → op → 残差），
+    但核心算法是可插拔的——通过 build_op() 工厂函数创建不同的算法组件，
+    就能得到功能完全不同的积木：
+
+      Block(op=MultiHeadAttention) → 注意力积木（原 AttentionBlock）
+      Block(op=FeedForward)        → 前馈网络积木（原 FFNBlock）
+
+    就像游戏里的武器模块：
+      - 积木 = 武器框架（固定的外壳和接口）
+      - 算法组件 = 可更换的核心模块（不同的弹药、瞄准器）
+      - 换一个模块，武器的功能就完全不同
 
     为什么需要残差连接？
     想象你在开会讨论一个问题：讨论完后你不会完全忘掉自己原来的想法，
@@ -459,51 +512,24 @@ class AttentionBlock(nn.Module):
     就像考试前先统一度量衡，这样后续计算更稳定，训练更快收敛。
     """
 
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
-        """
-        参数：
-            n_embd:     向量维度
-            n_head:     注意力头数（1 = 单头，>1 = 多头）
-            block_size: 最大上下文长度
-        """
-        super().__init__()
-        self.ln = nn.LayerNorm(n_embd)
-        # 统一使用 MultiHeadAttention，即使 n_head=1 也走同一条路径。
-        # 这样单头和多头的结构完全对称（都有投影层），对比实验更公平。
-        head_size = n_embd // n_head
-        self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Pre-Norm 架构：先归一化，再做注意力，最后加上残差
-        # 这是 GPT-2 以后的主流做法（比原始 Transformer 的 Post-Norm 更稳定）
-        return x + self.attn(self.ln(x))
-
-
-class FFNBlock(nn.Module):
-    """
-    前馈网络插件 —— 把 FFN 包装成一个标准积木块。
-
-    和 AttentionBlock 一样，包含 LayerNorm + FFN + 残差连接。
-    这个插件完全独立于注意力层，可以和任何 Block 自由搭配：
-      - 和单头注意力搭配：[AttentionBlock(n_head=1), FFNBlock]
-      - 和多头注意力搭配：[AttentionBlock(n_head=4), FFNBlock]
-      - 甚至可以单独使用（虽然效果不好，但技术上可行）
-    """
-
-    def __init__(self, n_embd: int):
+    def __init__(self, n_embd: int, op: nn.Module):
         """
         参数：
             n_embd: 向量维度
+            op:     算法组件，任何输入输出都是 (B, T, n_embd) 的模块
         """
         super().__init__()
         self.ln = nn.LayerNorm(n_embd)
-        self.ffn = FeedForward(n_embd)
+        self.op = op
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.ffn(self.ln(x))
+        # Pre-Norm 架构：先归一化，再执行算法组件，最后加上残差
+        # 这是 GPT-2 以后的主流做法（比原始 Transformer 的 Post-Norm 更稳定）
+        return x + self.op(self.ln(x))
 
 
 # ======================== 组装式模型 ========================
+
 
 class AssembledModel(BaseLanguageModel):
     """
@@ -530,8 +556,14 @@ class AssembledModel(BaseLanguageModel):
       model = AssembledModel(vocab_size, 64, 256, embedding, blocks)
     """
 
-    def __init__(self, vocab_size: int, n_embd: int, block_size: int,
-                 embedding: nn.Module, blocks: list[nn.Module]):
+    def __init__(
+        self,
+        vocab_size: int,
+        n_embd: int,
+        block_size: int,
+        embedding: nn.Module,
+        blocks: list[nn.Module],
+    ):
         """
         参数：
             vocab_size: 词表大小
@@ -574,8 +606,8 @@ class AssembledModel(BaseLanguageModel):
             x = block(x)
 
         # 最终归一化 + 输出层
-        x = self.ln_final(x)           # (B, T, n_embd)
-        logits = self.lm_head(x)       # (B, T, vocab_size)
+        x = self.ln_final(x)  # (B, T, n_embd)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
 
         loss = None
         if targets is not None:
@@ -589,8 +621,10 @@ class AssembledModel(BaseLanguageModel):
 
 # ======================== 插件工厂函数 ========================
 
-def build_embedding(embedding_type: str, vocab_size: int, n_embd: int,
-                    block_size: int) -> nn.Module:
+
+def build_embedding(
+    embedding_type: str, vocab_size: int, n_embd: int, block_size: int
+) -> nn.Module:
     """
     根据类型名称创建 Embedding 插件 —— 嵌入层的"选配单"。
 
@@ -611,36 +645,81 @@ def build_embedding(embedding_type: str, vocab_size: int, n_embd: int,
         raise ValueError(f"未知的 Embedding 类型: {embedding_type}")
 
 
-def build_blocks(block_names: list[str], n_embd: int, n_head: int,
-                 block_size: int) -> list[nn.Module]:
+def build_op(
+    name: str, n_embd: int, n_head: int, block_size: int, dropout: float = 0.0
+) -> nn.Module:
     """
-    根据名称列表创建 Block 实例 —— 积木的"组装说明书"。
+    算法组件工厂 —— 根据名称创建可插拔的算法组件。
+
+    积木（Block）的流程是固定的（LayerNorm → op → 残差），
+    这个工厂负责创建不同的 op（算法组件），插入积木中。
+
+    就像游戏里的武器改装：框架是同一个，换不同的核心模块就变成不同的武器。
+
+    参数：
+        name:       算法名称，"attention" 或 "ffn"
+        n_embd:     向量维度
+        n_head:     注意力头数（仅 attention 需要）
+        block_size: 最大上下文长度（仅 attention 需要）
+        dropout:    Dropout 比例。默认 0.0（不丢弃）。
+
+    返回：
+        算法组件实例（nn.Module，输入输出都是 (B, T, n_embd)）
+    """
+    if name == "attention":
+        head_size = n_embd // n_head
+        return MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
+    elif name == "ffn":
+        return FeedForward(n_embd, dropout)
+    else:
+        raise ValueError(f"未知的算法组件: {name}")
+
+
+def build_blocks(
+    block_names: list[str],
+    n_embd: int,
+    n_head: int,
+    block_size: int,
+    n_layer: int = 1,
+    dropout: float = 0.0,
+) -> list[nn.Module]:
+    """
+    积木组装说明书 —— 根据配置创建 Block 列表。
 
     这个函数是连接"配置"和"实际模型"的桥梁：
       - train.py 用它根据配置创建模型
       - generate.py 用它根据 checkpoint 里保存的配置重建模型
 
+    每个 Block 内部的流程是固定的（LayerNorm → 算法组件 → 残差连接），
+    block_names 决定了每个 Block 装配什么算法组件。
+    n_layer 决定了整套 block_names 重复几次（多层堆叠）。
+
+    示例：
+      build_blocks(["attention", "ffn"], n_layer=6)
+      → 创建 12 个 Block：[attn, ffn, attn, ffn, ..., attn, ffn]
+      → 这就是一个 6 层的 Transformer（和 GPT-2 架构相同）
+
     参数：
-        block_names: Block 名称列表，如 ["attention", "ffn"]
+        block_names: 算法组件名称列表，如 ["attention", "ffn"]
         n_embd:     向量维度
         n_head:     注意力头数
         block_size: 最大上下文长度
+        n_layer:    堆叠层数（把 block_names 重复几次）。默认 1，向后兼容旧配置。
+        dropout:    Dropout 比例，传递给算法组件。默认 0.0。
 
     返回：
         Block 实例列表
     """
     blocks = []
-    for name in block_names:
-        if name == "attention":
-            blocks.append(AttentionBlock(n_embd, n_head, block_size))
-        elif name == "ffn":
-            blocks.append(FFNBlock(n_embd))
-        else:
-            raise ValueError(f"未知的 Block 类型: {name}")
+    for _ in range(n_layer):
+        for name in block_names:
+            op = build_op(name, n_embd, n_head, block_size, dropout)
+            blocks.append(Block(n_embd, op))
     return blocks
 
 
 # ======================== Self-Attention 语言模型 ========================
+
 
 class SelfAttentionLanguageModel(BaseLanguageModel):
     """
@@ -750,4 +829,6 @@ MODEL_REGISTRY = {
     "attention_ffn": AssembledModel,
     "multihead": AssembledModel,
     "multihead_ffn": AssembledModel,
+    # Mini-GPT：多层 TransformerBlock 套装积木 + Dropout
+    "mini_gpt": AssembledModel,
 }
