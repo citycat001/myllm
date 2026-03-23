@@ -7,7 +7,7 @@
   - attention_ffn: 单头注意力 + 前馈网络
   - multihead:     多头注意力
   - multihead_ffn: 多头注意力 + 前馈网络
-  - mini_gpt:      Mini-GPT（6层 Transformer 套装积木 + Dropout）
+  - mini_gpt:      Mini-GPT（6层 Transformer + Dropout）
 
 用法：
   uv run python train.py                              # 默认训练 bigram 模型
@@ -102,10 +102,10 @@ MODEL_CONFIGS = {
         "lr": 3e-4,  # 更大的模型需要更小的学习率
         "n_embd": 384,  # 嵌入维度（384 / 6 头 = 每头 64 维）
         "n_head": 6,  # 6 头注意力
-        "n_layer": 6,  # 6 层 Transformer（堆叠 6 个 TransformerBlock）
+        "n_layer": 6,  # 6 层 Transformer（["attention", "ffn"] × 6 = 12 个 Block）
         "dropout": 0.2,  # 随机丢弃 20% 的连接，防止过拟合
         "embedding_type": "token_position",
-        "block_names": ["transformer"],  # 套装积木：注意力 + FFN + Dropout 一体化
+        "block_names": ["attention", "ffn"],  # 每层 = 注意力积木 + FFN 积木（含 Dropout）
     },
 }
 

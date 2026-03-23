@@ -7,15 +7,17 @@
   - SelfAttentionLanguageModel: 加入自注意力机制，能看到更多上下文
   - AssembledModel: 积木式模型，通过 Block 列表自由组装
 
-组件（可独立使用的积木块）：
-  - TokenEmbedding: 纯 token 嵌入（字 → 向量）
-  - TokenPositionEmbedding: token + 位置嵌入（字 + 位置 → 向量）
+算法组件（可插拔的核心算法）：
   - Head: 单个自注意力头
   - FeedForward: 前馈网络（两层 MLP）
   - MultiHeadAttention: 多头注意力（多个 Head 并行）
-  - AttentionBlock: 注意力散装插件（LayerNorm + 注意力 + 残差连接）
-  - FFNBlock: 前馈网络散装插件（LayerNorm + FFN + 残差连接）
-  - TransformerBlock: Transformer 套装插件（注意力 + FFN + Dropout + 残差连接）
+
+积木与插件：
+  - TokenEmbedding: 纯 token 嵌入（字 → 向量）
+  - TokenPositionEmbedding: token + 位置嵌入（字 + 位置 → 向量）
+  - Block: 通用积木（固定流程：LayerNorm → 算法组件 → 残差连接）
+  - build_op(): 算法组件工厂，根据名称创建可插拔的算法
+  - build_blocks(): 积木组装说明书，根据配置创建 Block 列表
 
 所有模型共享同一套 forward() 和 generate() 接口，
 这样 train.py 和 generate.py 不需要关心具体是哪个模型 —— 换模型就像换引擎，底盘不用动。
@@ -476,17 +478,29 @@ class MultiHeadAttention(nn.Module):
         return out
 
 
-# ======================== 可组装的 Block 插件 ========================
+# ======================== 通用积木 ========================
 
 
-class AttentionBlock(nn.Module):
+class Block(nn.Module):
     """
-    注意力插件 —— 把注意力层包装成一个标准积木块。
+    通用积木 —— 固定流程 + 可插拔算法组件。
 
-    包含三个部分：
-      1. LayerNorm：归一化，让输入的数值稳定在合理范围（防止数值爆炸或消失）
-      2. 注意力层：单头或多头，根据 n_head 自动选择
-      3. 残差连接：把注意力的输出加上原始输入（x + attention(x)）
+    积木定义了一个固定的处理流程：
+      1. LayerNorm：归一化输入
+      2. 算法组件（op）：执行核心操作（注意力、前馈网络等）
+      3. 残差连接：把输出加上原始输入
+
+    流程是固定的（每个积木都走 LayerNorm → op → 残差），
+    但核心算法是可插拔的——通过 build_op() 工厂函数创建不同的算法组件，
+    就能得到功能完全不同的积木：
+
+      Block(op=MultiHeadAttention) → 注意力积木（原 AttentionBlock）
+      Block(op=FeedForward)        → 前馈网络积木（原 FFNBlock）
+
+    就像游戏里的武器模块：
+      - 积木 = 武器框架（固定的外壳和接口）
+      - 算法组件 = 可更换的核心模块（不同的弹药、瞄准器）
+      - 换一个模块，武器的功能就完全不同
 
     为什么需要残差连接？
     想象你在开会讨论一个问题：讨论完后你不会完全忘掉自己原来的想法，
@@ -498,105 +512,20 @@ class AttentionBlock(nn.Module):
     就像考试前先统一度量衡，这样后续计算更稳定，训练更快收敛。
     """
 
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
-        """
-        参数：
-            n_embd:     向量维度
-            n_head:     注意力头数（1 = 单头，>1 = 多头）
-            block_size: 最大上下文长度
-        """
-        super().__init__()
-        self.ln = nn.LayerNorm(n_embd)
-        # 统一使用 MultiHeadAttention，即使 n_head=1 也走同一条路径。
-        # 这样单头和多头的结构完全对称（都有投影层），对比实验更公平。
-        head_size = n_embd // n_head
-        self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Pre-Norm 架构：先归一化，再做注意力，最后加上残差
-        # 这是 GPT-2 以后的主流做法（比原始 Transformer 的 Post-Norm 更稳定）
-        return x + self.attn(self.ln(x))
-
-
-class FFNBlock(nn.Module):
-    """
-    前馈网络插件 —— 把 FFN 包装成一个标准积木块。
-
-    和 AttentionBlock 一样，包含 LayerNorm + FFN + 残差连接。
-    这个插件完全独立于注意力层，可以和任何 Block 自由搭配：
-      - 和单头注意力搭配：[AttentionBlock(n_head=1), FFNBlock]
-      - 和多头注意力搭配：[AttentionBlock(n_head=4), FFNBlock]
-      - 甚至可以单独使用（虽然效果不好，但技术上可行）
-    """
-
-    def __init__(self, n_embd: int):
+    def __init__(self, n_embd: int, op: nn.Module):
         """
         参数：
             n_embd: 向量维度
+            op:     算法组件，任何输入输出都是 (B, T, n_embd) 的模块
         """
         super().__init__()
         self.ln = nn.LayerNorm(n_embd)
-        self.ffn = FeedForward(n_embd)
+        self.op = op
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.ffn(self.ln(x))
-
-
-# ======================== Transformer 套装积木 ========================
-
-
-class TransformerBlock(nn.Module):
-    """
-    Transformer 套装积木 —— 把注意力和前馈网络打包成一个完整的 Transformer 层。
-
-    之前的 AttentionBlock 和 FFNBlock 是"散装积木"，各自独立使用：
-      散装：[AttentionBlock] + [FFNBlock]，各管各的，没有 Dropout
-
-    TransformerBlock 是"套装积木"，内部整合了完整的一层 Transformer：
-      套装：[TransformerBlock] = 注意力 + FFN + Dropout，一步到位
-
-    就像游戏里的装备升级：
-      - 散装积木 = 新手装，零件自己凑，灵活但简陋
-      - 套装积木 = 高级套装，自带套装效果（Dropout 防过拟合），性能更强
-
-    真正的 GPT 就是把这样的 TransformerBlock 堆叠 N 层（n_layer=6 就是 6 层）。
-    每层结构相同但权重独立 —— 就像同样的会议流程开 6 轮，每轮讨论不同层次的问题。
-
-    内部结构（标准 GPT-2 Pre-Norm 架构）：
-      1. LayerNorm → 多头注意力 → 残差连接（"开会讨论"）
-      2. LayerNorm → 前馈网络 → 残差连接（"会后思考"）
-      3. Dropout 分布在注意力和 FFN 内部，防止过拟合
-    """
-
-    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.0):
-        """
-        参数：
-            n_embd:     向量维度
-            n_head:     注意力头数
-            block_size: 最大上下文长度
-            dropout:    Dropout 比例（传递给内部的注意力和 FFN 组件）
-        """
-        super().__init__()
-        head_size = n_embd // n_head
-        # 第一部分：LayerNorm + 多头注意力（内含 Dropout）
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
-        # 第二部分：LayerNorm + 前馈网络（内含 Dropout）
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.ffn = FeedForward(n_embd, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        参数：
-            x: 输入向量序列，形状 (B, T, n_embd)
-        返回：
-            处理后的向量序列，形状 (B, T, n_embd)
-        """
-        # Pre-Norm + 残差（标准 GPT-2 架构）
-        # Dropout 已在 MultiHeadAttention 和 FeedForward 内部处理，不在残差路径上重复
-        x = x + self.attn(self.ln1(x))  # 开会讨论 + 保留原有认知
-        x = x + self.ffn(self.ln2(x))  # 会后思考 + 保留讨论成果
-        return x
+        # Pre-Norm 架构：先归一化，再执行算法组件，最后加上残差
+        # 这是 GPT-2 以后的主流做法（比原始 Transformer 的 Post-Norm 更稳定）
+        return x + self.op(self.ln(x))
 
 
 # ======================== 组装式模型 ========================
@@ -716,6 +645,36 @@ def build_embedding(
         raise ValueError(f"未知的 Embedding 类型: {embedding_type}")
 
 
+def build_op(
+    name: str, n_embd: int, n_head: int, block_size: int, dropout: float = 0.0
+) -> nn.Module:
+    """
+    算法组件工厂 —— 根据名称创建可插拔的算法组件。
+
+    积木（Block）的流程是固定的（LayerNorm → op → 残差），
+    这个工厂负责创建不同的 op（算法组件），插入积木中。
+
+    就像游戏里的武器改装：框架是同一个，换不同的核心模块就变成不同的武器。
+
+    参数：
+        name:       算法名称，"attention" 或 "ffn"
+        n_embd:     向量维度
+        n_head:     注意力头数（仅 attention 需要）
+        block_size: 最大上下文长度（仅 attention 需要）
+        dropout:    Dropout 比例。默认 0.0（不丢弃）。
+
+    返回：
+        算法组件实例（nn.Module，输入输出都是 (B, T, n_embd)）
+    """
+    if name == "attention":
+        head_size = n_embd // n_head
+        return MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
+    elif name == "ffn":
+        return FeedForward(n_embd, dropout)
+    else:
+        raise ValueError(f"未知的算法组件: {name}")
+
+
 def build_blocks(
     block_names: list[str],
     n_embd: int,
@@ -725,19 +684,28 @@ def build_blocks(
     dropout: float = 0.0,
 ) -> list[nn.Module]:
     """
-    根据名称列表创建 Block 实例 —— 积木的"组装说明书"。
+    积木组装说明书 —— 根据配置创建 Block 列表。
 
     这个函数是连接"配置"和"实际模型"的桥梁：
       - train.py 用它根据配置创建模型
       - generate.py 用它根据 checkpoint 里保存的配置重建模型
 
+    每个 Block 内部的流程是固定的（LayerNorm → 算法组件 → 残差连接），
+    block_names 决定了每个 Block 装配什么算法组件。
+    n_layer 决定了整套 block_names 重复几次（多层堆叠）。
+
+    示例：
+      build_blocks(["attention", "ffn"], n_layer=6)
+      → 创建 12 个 Block：[attn, ffn, attn, ffn, ..., attn, ffn]
+      → 这就是一个 6 层的 Transformer（和 GPT-2 架构相同）
+
     参数：
-        block_names: Block 名称列表，如 ["attention", "ffn"] 或 ["transformer"]
+        block_names: 算法组件名称列表，如 ["attention", "ffn"]
         n_embd:     向量维度
         n_head:     注意力头数
         block_size: 最大上下文长度
         n_layer:    堆叠层数（把 block_names 重复几次）。默认 1，向后兼容旧配置。
-        dropout:    Dropout 比例，仅 TransformerBlock 使用。默认 0.0。
+        dropout:    Dropout 比例，传递给算法组件。默认 0.0。
 
     返回：
         Block 实例列表
@@ -745,14 +713,8 @@ def build_blocks(
     blocks = []
     for _ in range(n_layer):
         for name in block_names:
-            if name == "attention":
-                blocks.append(AttentionBlock(n_embd, n_head, block_size))
-            elif name == "ffn":
-                blocks.append(FFNBlock(n_embd))
-            elif name == "transformer":
-                blocks.append(TransformerBlock(n_embd, n_head, block_size, dropout))
-            else:
-                raise ValueError(f"未知的 Block 类型: {name}")
+            op = build_op(name, n_embd, n_head, block_size, dropout)
+            blocks.append(Block(n_embd, op))
     return blocks
 
 

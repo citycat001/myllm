@@ -15,7 +15,7 @@
 | 第 5 步 | BPE 分词器 | 待做 |
 | 第 6 步 | 自定义数据微调 | 待做 |
 
-**本篇新增的核心概念：TransformerBlock（套装积木）、多层堆叠（n_layer）、Dropout（正则化）**
+**本篇新增的核心概念：Block（通用积木 = 固定流程 + 可插拔算法）、多层堆叠（n_layer）、Dropout（正则化）**
 
 ---
 
@@ -138,75 +138,82 @@ self.dropout = nn.Dropout(0.2)  # 随机丢弃 20% 的值
 
 ---
 
-## TransformerBlock：套装积木
+## 积木重构：固定流程 + 可插拔算法
 
-理解了多层堆叠和 Dropout 的必要性后，我们来设计新的积木。
+理解了多层堆叠和 Dropout 的必要性后，我们来重新设计积木架构。
 
-### 设计思路：散装 vs 套装
+### 上一篇的问题
 
-```
-散装积木（第 3 篇的设计）：
-  [AttentionBlock] + [FFNBlock]
-  - 优点：灵活，可以单独使用
-  - 缺点：没有 Dropout，不适合多层堆叠
-
-套装积木（本篇新增）：
-  [TransformerBlock] = 注意力 + FFN + Dropout，一步到位
-  - 优点：完整的 Transformer 层，自带 Dropout
-  - 缺点：不能拆开单独用（但多层模型也不需要拆）
-```
-
-这就像游戏里的装备升级：
-- 散装积木 = 新手装备，零件自己凑，灵活但简陋
-- 套装积木 = 高级套装，自带套装效果，性能更强
-
-**两种积木并存，旧积木不修改，新积木独立新增。** 通过配置选择使用哪种。
-
-### TransformerBlock 的内部结构
+上一篇的 `AttentionBlock` 和 `FFNBlock` 各自把 LayerNorm、核心算法、残差连接**硬编码**在一起。看起来是模块化的，但仔细一想：
 
 ```
-TransformerBlock（1 个完整的 Transformer 层）
-│
-├── 第一部分：开会讨论
-│   ├── LayerNorm：归一化输入
-│   ├── MultiHeadAttention：多头注意力（内含注意力权重 Dropout + 投影后 Dropout）
-│   └── 残差连接：x = x + attn(ln(x))
-│
-└── 第二部分：独立思考
-    ├── LayerNorm：归一化
-    ├── FeedForward：前馈网络（内含输出 Dropout）
-    └── 残差连接：x = x + ffn(ln(x))
+AttentionBlock 内部：LayerNorm → MultiHeadAttention → 残差    ← 三者焊死在一起
+FFNBlock 内部：      LayerNorm → FeedForward → 残差           ← 三者焊死在一起
+```
+
+**每种积木都把流程和算法绑定了。** 如果将来我们想换一种注意力算法（比如 GroupedQueryAttention），就得新建一个 Block 类。
+
+### 新设计：积木 = 固定流程 + 可插拔算法
+
+游戏里的武器是怎么设计的？**框架固定，模块可换。** 同一个武器框架，装上不同的核心模块，就变成不同的武器。
+
+我们的积木也应该这样：
+
+```
+Block（通用积木框架）
+├── 固定流程：LayerNorm → [算法组件] → 残差连接    ← 框架不变
+└── 可插拔算法（op）：                              ← 核心模块可换
+    ├── MultiHeadAttention  → 变成注意力积木
+    ├── FeedForward         → 变成前馈网络积木
+    └── 未来可扩展...       → 变成任何新积木
 ```
 
 ### 代码实现
 
-```python
-class TransformerBlock(nn.Module):
-    """Transformer 套装积木 —— 注意力 + FFN + Dropout，一个完整的 Transformer 层。"""
+通用积木只有 10 行代码：
 
-    def __init__(self, n_embd, n_head, block_size, dropout=0.0):
+```python
+class Block(nn.Module):
+    """通用积木 —— 固定流程 + 可插拔算法组件。"""
+
+    def __init__(self, n_embd, op):
         super().__init__()
-        head_size = n_embd // n_head
-        # 第一部分：LayerNorm + 多头注意力（内含 Dropout）
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
-        # 第二部分：LayerNorm + 前馈网络（内含 Dropout）
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.ffn = FeedForward(n_embd, dropout)
+        self.ln = nn.LayerNorm(n_embd)
+        self.op = op  # 可插拔的算法组件
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))   # 开会讨论 + 保留原有认知
-        x = x + self.ffn(self.ln2(x))    # 会后思考 + 保留讨论成果
-        return x
+        return x + self.op(self.ln(x))  # LayerNorm → 算法 → 残差
 ```
 
-代码非常简洁——因为复杂性都封装在了 `MultiHeadAttention` 和 `FeedForward` 内部。
+`op` 可以是任何输入输出都是 `(B, T, n_embd)` 的模块。换不同的 `op`，积木的功能就完全不同：
 
-**Dropout 在哪？** 不在 TransformerBlock 的 forward 里，而在组件内部：
+```python
+# 注意力积木（等价于上一篇的 AttentionBlock）
+Block(n_embd=384, op=MultiHeadAttention(384, 6, 64, 256, dropout=0.2))
+
+# 前馈网络积木（等价于上一篇的 FFNBlock）
+Block(n_embd=384, op=FeedForward(384, dropout=0.2))
+```
+
+### 算法组件工厂：build_op
+
+手动创建 op 太繁琐，我们提供一个工厂函数：
+
+```python
+def build_op(name, n_embd, n_head, block_size, dropout=0.0):
+    """根据名称创建可插拔的算法组件。"""
+    if name == "attention":
+        head_size = n_embd // n_head
+        return MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
+    elif name == "ffn":
+        return FeedForward(n_embd, dropout)
+```
+
+**Dropout 在哪？** 在算法组件内部，不在积木流程里：
 - `MultiHeadAttention`：softmax 后的注意力权重 Dropout + 投影后 Dropout
 - `FeedForward`：第二层线性变换后的 Dropout
 
-这遵循了 GPT-2 的标准做法：**Dropout 在组件内部，不在残差路径上重复。**
+这遵循了 GPT-2 的标准做法：**Dropout 在算法组件内部，不在残差路径上重复。**
 
 ### 给 Head、FeedForward、MultiHeadAttention 加 Dropout 支持
 
@@ -254,7 +261,7 @@ class MultiHeadAttention(nn.Module):
 
 ## n_layer：一键堆叠多层
 
-有了 `TransformerBlock`，堆叠多层就变得很简单。我们给 `build_blocks()` 工厂函数加了 `n_layer` 参数：
+有了通用 Block + build_op，堆叠多层就变得很简单。`build_blocks()` 工厂函数用 `n_layer` 控制重复次数：
 
 ```python
 def build_blocks(block_names, n_embd, n_head, block_size,
@@ -262,18 +269,21 @@ def build_blocks(block_names, n_embd, n_head, block_size,
     blocks = []
     for _ in range(n_layer):          # ← 重复 n_layer 次
         for name in block_names:
-            if name == "transformer":
-                blocks.append(TransformerBlock(n_embd, n_head, block_size, dropout))
-            elif name == "attention":
-                blocks.append(AttentionBlock(n_embd, n_head, block_size))
-            elif name == "ffn":
-                blocks.append(FFNBlock(n_embd))
+            op = build_op(name, n_embd, n_head, block_size, dropout)
+            blocks.append(Block(n_embd, op))
     return blocks
 ```
 
-`n_layer=6` + `block_names=["transformer"]` → 创建 6 个独立的 TransformerBlock。
+`n_layer=6` + `block_names=["attention", "ffn"]` → 创建 12 个 Block（6 层 × 每层 2 个积木）。
 
-**"独立"的意思是：每层的结构相同，但权重不同。** 就像同一个会议流程开 6 轮，每轮的参会者讨论的内容和结论都不一样——因为每层有自己独立的 Q/K/V 矩阵、FFN 权重等参数，各自通过训练学到不同的东西。
+```
+第 1 层：Block(attention) → Block(ffn)    ← 开会 + 思考
+第 2 层：Block(attention) → Block(ffn)    ← 开会 + 思考
+ ...
+第 6 层：Block(attention) → Block(ffn)    ← 开会 + 思考
+```
+
+**每层的结构相同，但权重不同。** 就像同一个会议流程开 6 轮，每轮的参会者讨论的内容和结论都不一样——因为每层有自己独立的 Q/K/V 矩阵、FFN 权重等参数，各自通过训练学到不同的东西。
 
 ---
 
@@ -292,7 +302,7 @@ def build_blocks(block_names, n_embd, n_head, block_size,
     "n_layer": 6,           # 6 层 Transformer
     "dropout": 0.2,         # 随机丢弃 20% 的连接
     "embedding_type": "token_position",
-    "block_names": ["transformer"],  # 套装积木
+    "block_names": ["attention", "ffn"],  # 每层 = 注意力积木 + FFN 积木
 },
 ```
 
@@ -330,22 +340,22 @@ Mini-GPT 的参数量是 multihead_ffn 的约 43 倍，但这些参数分布在 
 
 → Token Embedding + Position Embedding    # 字义 + 位置 → 384维向量
 
-→ TransformerBlock 第 1 层
+→ 第 1 层：Block(attention) + Block(ffn)
   ├── 6头注意力：识别基本的词组关系（"曹操" 是人名、"引兵" 是动宾）
   ├── FFN：提炼词级别的语义特征
   └── Dropout：随机丢弃 20% 的连接
 
-→ TransformerBlock 第 2 层
+→ 第 2 层：Block(attention) + Block(ffn)
   ├── 6头注意力：理解句法结构（主语-谓语-宾语）
   ├── FFN：深化句法理解
   └── Dropout
 
-→ TransformerBlock 第 3 层
+→ 第 3 层：Block(attention) + Block(ffn)
   ├── 6头注意力：建立事件关系（追赶是谁发起的、对象是谁）
   ├── FFN：综合事件信息
   └── Dropout
 
-→ TransformerBlock 第 4-6 层
+→ 第 4-6 层：Block(attention) + Block(ffn)
   ├── 逐层加深：从词组 → 句法 → 事件 → 语境 → 预测
   └── 每层都在上一层的理解基础上进一步抽象
 
@@ -385,13 +395,13 @@ uv run python generate.py --model mini_gpt_model.pt --prompt "却说曹操" --le
 
 | 你学到了什么 | 一句话回顾 |
 |-------------|-----------|
-| **TransformerBlock** | 套装积木：注意力 + FFN + Dropout，一个完整的 Transformer 层 |
-| **多层堆叠（n_layer）** | 重复 N 次 TransformerBlock，逐层加深理解 |
+| **Block（通用积木）** | 固定流程（LN → op → 残差）+ 可插拔算法组件 |
+| **build_op（算法工厂）** | 根据名称创建不同的算法组件，插入积木中 |
+| **多层堆叠（n_layer）** | 重复 N 次 [attention, ffn]，逐层加深理解 |
 | **Dropout** | 训练时随机丢弃部分连接，防止过拟合（推理时自动关闭） |
-| **散装 vs 套装** | 散装灵活但简陋，套装自带 Dropout 适合构建完整模型 |
 | **超参数升级** | n_embd 64→384, n_head 4→6, 加入 n_layer 和 dropout |
 
-从 1 层散装积木到 6 层套装 Transformer，模型的架构已经和真正的 GPT-2 完全一致——只是规模小一些。这就是 **Mini-GPT**。
+从 1 层积木到 6 层 Transformer，模型的架构已经和真正的 GPT-2 完全一致——只是规模小一些。这就是 **Mini-GPT**。
 
 回顾一下我们走过的路：
 
