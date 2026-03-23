@@ -274,15 +274,106 @@ UI elements (technical names shown as bilingual labels per REQ-003).
 - Godot 4.4 game engine
 - Python + PyTorch runtime on user's machine (v1)
 
+## Component-to-Aircraft Mapping (Per Era)
+
+### Era 1: WWI Biplane → Bigram
+| Part | LLM Component | Slots |
+|------|--------------|-------|
+| 木质机身 | Token Embedding (vocab→vocab) | 1 |
+| 布蒙皮双翼 | Embedding lookup table | 1 |
+| 螺旋桨 | Forward pass | 1 |
+
+### Era 2: WWII Monoplane → + Self-Attention
+| New Part | LLM Component | Slots |
+|----------|--------------|-------|
+| 金属机身 | TokenPositionEmbedding | replaces 木质机身 |
+| 单翼 | Self-Attention Head | replaces 双翼 |
+| 导航仪 | Position Embedding | 1 new |
+| 可收放起落架 | Output Linear projection | 1 new |
+
+### Era 3: 1950s Jet → + Multi-Head + FFN
+| New Part | LLM Component | Slots |
+|----------|--------------|-------|
+| 喷气引擎 | FeedForward (MLP+ReLU) | replaces 螺旋桨 |
+| 进气道 | Block input (LayerNorm) | 1 new |
+| 机载雷达 | Multi-Head Attention | 1 new |
+| 后掠翼 | Residual Connection | replaces 单翼 |
+
+### Era 4: Modern Fighter → Mini-GPT (multi-layer)
+| New Part | LLM Component | Slots |
+|----------|--------------|-------|
+| 双引擎 | n_layer stacking (multiple blocks) | upgrades 引擎 |
+| 电传飞控 | Block pipeline (AssembledModel) | 1 new |
+| 全动尾翼 | Per-block LayerNorm | 1 new |
+| 先进航电 | Larger n_embd / n_head | upgrades params |
+
+### Era 5: Stealth Fighter → + Dropout + BPE
+| New Part | LLM Component | Slots |
+|----------|--------------|-------|
+| 隐身涂层 | Dropout | 1 new |
+| S型进气道 | BPE Tokenizer | replaces CharTokenizer |
+| 内置弹仓 | Larger model capacity | upgrades params |
+
+### Slot Algorithm Variants (future versions)
+v1 uses one algorithm per slot (existing implementations only).
+Future versions add swappable algorithms per slot, each paired
+with an article:
+- Engine: ReLU (v1) → GELU → SwiGLU
+- Radar: Standard MHA (v1) → MQA → GQA
+- Navigation: Absolute PE (v1) → RoPE → ALiBi
+- Fuel: AdamW (v1) → SGD → Lion
+- Wings: LayerNorm (v1) → RMSNorm
+- Flight plan: Constant LR (v1) → Cosine → Warmup+Decay
+
+## Challenge Evaluation Rules
+
+| Era | Challenge | Evaluation |
+|-----|-----------|------------|
+| Era 1 | 生成包含中文字符的文本 | len > 0 and contains Chinese chars |
+| Era 1 | 说出一个三国人物 | regex match against preset name list |
+| Era 2 | 生成超过10字的连贯文本 | len >= 10 and no char repeats > 3 |
+| Era 3 | 续写"却说曹操" | output contains >= 2 distinct names |
+| Era 4 | 生成包含对话的文本 | contains quote pairs ("..." or 「...」) |
+| Era 5 | 生成50字以上的流畅段落 | len >= 50 + no repeats + has punctuation |
+
+All evaluation uses simple rules (regex + keyword list + length).
+No external model evaluation in v1.
+
+## Quality Expectation Framing
+
+Each era displays an ability level that frames output quality:
+
+| Era | Level Name | UI Message | Expected Quality |
+|-----|-----------|------------|-----------------|
+| Era 1 | 试飞学员 | "双翼机刚学会飞，只能说零散的字" | Mostly gibberish |
+| Era 2 | 新手飞行员 | "能看到更远了，开始说出短句" | Chinese-like fragments |
+| Era 3 | 空军中尉 | "喷气式速度快，能说出通顺的句子" | Occasional coherent sentences |
+| Era 4 | 王牌飞行员 | "现代战斗机很聪明，能编出故事" | Mostly coherent |
+| Era 5 | 隐形战神 | "最强飞机，说话又快又好" | Fluent paragraphs |
+
+Design principle: not "model is bad" but "aircraft is still growing".
+Cross-era comparison of output quality is the key teaching moment.
+
 ## Open Questions
 
-1. **Component-to-aircraft-part mapping**: Exact naming for each LLM
-   component as an aircraft part (e.g., Embedding = 机身骨架? Attention
-   = 引擎? FFN = 加力燃烧室?). Needs domain expert + child testing.
-2. **Challenge evaluation heuristics**: How to automatically judge if
-   generated text "contains a person's name" or "forms a complete
-   sentence". Simple regex/keyword matching vs. more sophisticated
-   evaluation.
-3. **Quality expectation framing**: How to present character-level model
-   output (often gibberish for simple models) as a positive learning
-   experience rather than a disappointment.
+None — all original questions resolved in clarification session
+2026-03-23.
+
+## Clarifications
+
+### Session 2026-03-23
+- Q: Component-to-aircraft-part mapping → A: Era-specific mapping
+  defined (see Component-to-Aircraft Mapping section). Parts evolve
+  with eras: 木质机身→金属机身, 双翼→单翼→后掠翼, 螺旋桨→喷气引擎→双引擎.
+- Q: Slot structure per era → A: Slots increase per era (3→5→7→8→9+).
+  v1 uses one algorithm per slot (existing implementations only).
+  Future versions add swappable algorithms, each paired with an article.
+- Q: Challenge evaluation heuristics → A: Simple rules only (regex +
+  keyword list + length checks). No external model evaluation in v1.
+- Q: Quality expectation framing → A: Ability level system ("试飞学员"
+  to "隐形战神") frames output quality as aircraft growth, not model
+  failure. Cross-era comparison is the teaching moment.
+- Q: Training parameter exposure → A: v1 hides all numeric parameters.
+  Differentiation comes from slot structure and era progression, not
+  from user-tunable knobs. Algorithm variants deferred to future
+  versions.
