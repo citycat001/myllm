@@ -1,8 +1,9 @@
 <!--
 Sync Impact Report
 ===================
-Version change: N/A -> 1.0.0
-Added sections: All (initial creation)
+Version change: 1.0.0 -> 1.1.0 (MINOR — 3 new principles added)
+Added principles: P8 Single Skin First, P9 Sub-60s Training, P10 Era = Complexity Tier
+Modified sections: Mission Statement (refined Game path description)
 Removed sections: None
 Templates requiring updates: None (no .specify/templates exist yet)
 Follow-up TODOs: None
@@ -10,7 +11,7 @@ Follow-up TODOs: None
 
 # Project Constitution: myllm
 
-**Version**: 1.0.0
+**Version**: 1.1.0
 **Ratification Date**: 2026-03-23
 **Last Amended**: 2026-03-23
 
@@ -27,9 +28,10 @@ The project delivers two complementary experiences:
 1. **Code path** — A step-by-step Python codebase that evolves from a
    simple bigram model to a full transformer, with composable pluggable
    components.
-2. **Game path** — A drag-and-drop visual game where users assemble
-   items (planes, weapons, armor, etc.) from components that secretly
-   map to real LLM building blocks, producing runnable training configs.
+2. **Game path** — A drag-and-drop desktop game (Godot 4.x) where users
+   assemble aircraft from components that map to real LLM building blocks.
+   Aircraft era evolution (biplane → stealth) drives progressive LLM
+   complexity. Assembly produces JSON config → Python training script.
 
 ## Principles
 
@@ -103,6 +105,40 @@ infrastructure.
 
 **Rationale**: Every unnecessary feature is a distraction from the
 teaching mission and increases maintenance burden.
+
+### P8: Single Skin First
+
+v1 MUST ship with only one theme skin (aircraft top-down line drawings).
+Additional skins MUST NOT be developed until the core game loop
+(assemble → train → chat) is validated with real users.
+
+**Rationale**: Multiple skins multiply art assets, metaphor design, and
+testing effort. Validate the concept before scaling it.
+
+### P9: Sub-60s Training
+
+All default model configurations presented in the game MUST complete
+training on CPU in under 60 seconds. Configurations that exceed this
+limit MUST NOT be offered as defaults — they may be offered as optional
+"advanced" presets with a clear time warning.
+
+**Rationale**: Target audience is children. Research shows kids abandon
+tasks after ~15 seconds of waiting. 60 seconds is the absolute ceiling
+for a game experience.
+
+### P10: Era = Complexity Tier
+
+Aircraft eras MUST map to LLM complexity tiers in strict chronological
+order. Users MUST NOT access a later era's components without completing
+the prior era's challenges. The mapping is:
+- WWI biplane → Bigram model
+- WWII monoplane → + Self-Attention
+- 1950s jet → + Multi-Head Attention + FFN
+- Modern fighter → Mini-GPT (multi-layer Transformer)
+- Stealth fighter → + Dropout, BPE, advanced components
+
+**Rationale**: Historical aircraft evolution provides a natural,
+intuitive difficulty curve that aligns with P2 (Progressive Disclosure).
 
 ## Governance
 
