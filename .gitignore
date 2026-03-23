@@ -8,3 +8,4 @@ data/
 .dolt/
 *.db
 .beads/
+.worktrees/
