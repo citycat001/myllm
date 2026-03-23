@@ -128,9 +128,13 @@ self.dropout = nn.Dropout(0.2)  # 随机丢弃 20% 的值
 # 推理时：什么都不做（nn.Dropout 自动检测 train/eval 模式）
 ```
 
-### Dropout 放在哪里？
+---
 
-在标准的 GPT-2 架构中，Dropout 分布在三个地方：
+## Dropout 加在哪里？
+
+上一篇我们设计了通用积木 `Block`（固定流程 + 可插拔算法组件）和 `build_op` 算法工厂。现在要把 Dropout 加进去。
+
+Dropout 加在**算法组件内部**，不在积木的流程里。积木本身的流程（LayerNorm → op → 残差）完全不变。具体位置遵循 GPT-2 的标准做法：
 
 ```
 注意力头内部：
@@ -145,88 +149,9 @@ self.dropout = nn.Dropout(0.2)  # 随机丢弃 20% 的值
 
 每个 Dropout 都在做同一件事：**随机丢弃一些信息，迫使模型不要过度依赖任何单一的特征或连接。**
 
----
-
-## 积木重构：固定流程 + 可插拔算法
-
-理解了多层堆叠和 Dropout 的必要性后，我们来重新设计积木架构。
-
-### 上一篇的问题
-
-上一篇的 `AttentionBlock` 和 `FFNBlock` 各自把 LayerNorm、核心算法、残差连接**硬编码**在一起。看起来是模块化的，但仔细一想：
-
-```
-AttentionBlock 内部：LayerNorm → MultiHeadAttention → 残差    ← 三者焊死在一起
-FFNBlock 内部：      LayerNorm → FeedForward → 残差           ← 三者焊死在一起
-```
-
-**每种积木都把流程和算法绑定了。** 如果将来我们想换一种注意力算法（比如 GroupedQueryAttention），就得新建一个 Block 类。
-
-### 新设计：积木 = 固定流程 + 可插拔算法
-
-游戏里的武器是怎么设计的？**框架固定，模块可换。** 同一个武器框架，装上不同的核心模块，就变成不同的武器。
-
-我们的积木也应该这样：
-
-```
-Block（通用积木框架）
-├── 固定流程：LayerNorm → [算法组件] → 残差连接    ← 框架不变
-└── 可插拔算法（op）：                              ← 核心模块可换
-    ├── MultiHeadAttention  → 变成注意力积木
-    ├── FeedForward         → 变成前馈网络积木
-    └── 未来可扩展...       → 变成任何新积木
-```
-
-### 代码实现
-
-通用积木只有 10 行代码：
-
-```python
-class Block(nn.Module):
-    """通用积木 —— 固定流程 + 可插拔算法组件。"""
-
-    def __init__(self, n_embd, op):
-        super().__init__()
-        self.ln = nn.LayerNorm(n_embd)
-        self.op = op  # 可插拔的算法组件
-
-    def forward(self, x):
-        return x + self.op(self.ln(x))  # LayerNorm → 算法 → 残差
-```
-
-`op` 可以是任何输入输出都是 `(B, T, n_embd)` 的模块。换不同的 `op`，积木的功能就完全不同：
-
-```python
-# 注意力积木（等价于上一篇的 AttentionBlock）
-Block(n_embd=384, op=MultiHeadAttention(384, 6, 64, 256, dropout=0.2))
-
-# 前馈网络积木（等价于上一篇的 FFNBlock）
-Block(n_embd=384, op=FeedForward(384, dropout=0.2))
-```
-
-### 算法组件工厂：build_op
-
-手动创建 op 太繁琐，我们提供一个工厂函数：
-
-```python
-def build_op(name, n_embd, n_head, block_size, dropout=0.0):
-    """根据名称创建可插拔的算法组件。"""
-    if name == "attention":
-        head_size = n_embd // n_head
-        return MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
-    elif name == "ffn":
-        return FeedForward(n_embd, dropout)
-```
-
-**Dropout 在哪？** 在算法组件内部，不在积木流程里：
-- `MultiHeadAttention`：softmax 后的注意力权重 Dropout + 投影后 Dropout
-- `FeedForward`：第二层线性变换后的 Dropout
-
-这遵循了 GPT-2 的标准做法：**Dropout 在算法组件内部，不在残差路径上重复。**
-
 ### 给 Head、FeedForward、MultiHeadAttention 加 Dropout 支持
 
-为了让 TransformerBlock 能传递 dropout 参数，我们给三个底层组件加了可选的 `dropout` 参数：
+我们给三个算法组件加了可选的 `dropout` 参数，通过 `build_op` 传递：
 
 ```python
 class Head(nn.Module):
