@@ -34,6 +34,5 @@
 - Spec references "JSON config matching MODEL_CONFIGS structure" in
   REQ-004 — this is a necessary interface contract, not an implementation
   detail, since the Python backend already exists.
-- 3 open questions remain (component naming, challenge heuristics,
-  quality framing) — these are design decisions best resolved during
-  /projkit.main.clarify or /projkit.main.plan, not blockers for the spec.
+- All 3 original open questions resolved in clarification session
+  2026-03-23 (component mapping, challenge heuristics, quality framing).

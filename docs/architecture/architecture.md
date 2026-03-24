@@ -442,3 +442,11 @@ enabling API integration. Does not change model.py at all.
   roadmap step 5)
 - Single concurrent training session (no parallel model training)
 - No model caching (re-trains from scratch each time)
+- MODEL_REGISTRY has no "assembled" key — game configs use
+  AssembledModel via specific names (attention_ffn, multihead, etc.).
+  Need to either add a generic "assembled" registry entry or have the
+  Config Loader map era configs to existing model type names.
+- Era 2 (single-head self-attention) has no direct assembled config
+  in the codebase. Current "attention" type uses SelfAttentionLanguageModel
+  (non-assembled). Will need either n_head=1 with AssembledModel or a
+  new factory path.

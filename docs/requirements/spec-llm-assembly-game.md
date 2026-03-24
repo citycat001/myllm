@@ -14,7 +14,7 @@ status: Draft
 
 **Target user**: 零基础孩子 / 初中生（无编程或 AI 知识）
 **Discovery**: [discovery-llm-assembly-game.md](discovery-llm-assembly-game.md)
-**Constitution**: [constitution.md](constitution.md) v1.1.0
+**Constitution**: [constitution.md](constitution.md) v1.1.1
 
 ## Functional Requirements
 
