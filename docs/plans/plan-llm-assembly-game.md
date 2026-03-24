@@ -49,12 +49,16 @@ POST /chat, GET /health. Refactors train.py into callable
 `train_model(config, progress_callback)` function. Refactors
 generate.py into callable `generate_text(checkpoint, prompt, max_tokens)`
 function. Adds `--config <json-path>` CLI mode to train.py for
-standalone use. Training runs in background thread with cancellation
-flag. Config Loader validates JSON against MODEL_CONFIGS schema and
-enforces P9 parameter limits (<60s CPU training).
+standalone use (developer tool, not the game's primary path — game
+uses HTTP per ADR-1). Training runs in background thread with
+cancellation flag. Config Loader validates JSON against MODEL_CONFIGS
+schema and enforces P9 parameter limits (<60s CPU training).
 
-Known gap: MODEL_REGISTRY needs a generic "assembled" entry or
-Config Loader must map era configs to existing model type names.
+Known gaps:
+- MODEL_REGISTRY needs a generic "assembled" entry or Config Loader
+  must map era configs to existing model type names.
+- Era 2 (single-head self-attention) has no assembled config path —
+  need n_head=1 with AssembledModel or a new factory route.
 
 ### Design Component 2: Component Registry (Data)
 **ID**: DES-002
@@ -84,6 +88,13 @@ feedback: green highlight for valid drops, red for invalid, snap
 animation on placement. Components show dual labels (game + tech name)
 and ability stat bars. Users can remove/swap placed components. Frame
 validates completeness before enabling "试飞!" button.
+
+Slot layout per era (from spec clarifications):
+- Era 1 (biplane): 3 slots — fuselage, wings, propeller
+- Era 2 (monoplane): 5 slots — fuselage, wing, propeller, nav, landing gear
+- Era 3 (jet): 7 slots — fuselage, swept wing, jet engine, intake, radar, gear, tail
+- Era 4 (fighter): 8 slots — fuselage, wing, 2x engine, intake, radar, fly-by-wire, tail
+- Era 5 (stealth): 9+ slots — above + stealth coating, S-intake, internal bay
 
 ### Design Component 4: Config Generator
 **ID**: DES-004
@@ -153,13 +164,14 @@ No login or account required.
 **Wave**: 3
 **Depends on**: DES-003, DES-005, DES-006
 
-All user-facing text strings consolidated in a Chinese string table.
-Tooltips on all interactive elements. Technical terms show Chinese
-explanation on first appearance (tooltip or inline). Error messages
-use child-friendly language ("飞机还没装好引擎呢！" not "Error:
-missing block_names"). Aircraft visual theme: top-down line drawing
-style, 5 distinct era silhouettes. Ability-level labels and UI
-framing for output quality per era.
+All user-facing text strings consolidated in a GDScript autoload
+dictionary (e.g., `Strings.gd` singleton mapping string keys to
+Chinese text). Tooltips on all interactive elements. Technical terms
+show Chinese explanation on first appearance (tooltip or inline).
+Error messages use child-friendly language ("飞机还没装好引擎呢！"
+not "Error: missing block_names"). Aircraft visual theme: top-down
+line drawing style, 5 distinct era silhouettes. Ability-level labels
+and UI framing for output quality per era.
 
 ## Wave Summary
 
